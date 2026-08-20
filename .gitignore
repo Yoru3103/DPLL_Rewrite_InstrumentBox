@@ -1,0 +1,135 @@
+# ============================================================
+# Vivado project - generated/cache/output directories
+# ============================================================
+
+*.cache/
+*.hw/
+*.runs/
+*.sim/
+*.ioplanning/
+*.ip_user_files/
+*.gen/
+
+# Vivado temporary and local state
+.Xil/
+*.jou
+*.log
+*.str
+*.pb
+*.wdf
+*.wdb
+*.vcd
+*.vpd
+*.key
+*.tmp
+*.bak
+*.backup
+*.html
+*.xml.bak
+
+# Vivado generated checkpoints, netlists and outputs
+*.dcp
+*.bit
+*.bin
+*.ltx
+*.rpt
+*.rpx
+*.vdi
+*.vds
+*.hwdef
+*.sysdef
+
+# Keep source constraints/IP configuration even if extensions overlap
+!*.xci
+!*.xcix
+!*.bd
+!*.xdc
+!*.coe
+!*.mem
+!*.mif
+
+# ============================================================
+# Xilinx SDK workspace state
+# ============================================================
+
+**/.metadata/
+**/.sdk/
+**/RemoteSystemsTempFiles/
+**/webtalk/
+
+# SDK application build outputs
+**/Debug/
+**/Release/
+**/bootimage/BOOT.bin
+
+# Compiled software artifacts
+*.elf
+*.o
+*.obj
+*.a
+*.so
+*.map
+*.d
+*.su
+*.size
+*.hex
+
+# ============================================================
+# Generated BSP contents
+# ============================================================
+
+# Keep BSP project descriptors/configuration, ignore generated libraries
+**/*_bsp/ps7_cortexa9_0/
+**/*_bsp/lib/
+**/*_bsp/include/
+
+# Do not ignore the BSP reconstruction metadata
+!**/*_bsp/.project
+!**/*_bsp/.cproject
+!**/*_bsp/system.mss
+
+# ============================================================
+# IP generated output products
+# ============================================================
+
+# Configuration files (.xci/.xcix) stay tracked; these are regenerated
+**/ip_user_files/
+**/.Xil/
+
+# Common generated IP files under source-tree IP directories
+**/*_stub.v
+**/*_stub.vhdl
+**/*_sim_netlist.v
+**/*_sim_netlist.vhdl
+**/*_ooc.xdc
+**/*.veo
+**/*.vho
+
+# Generated synthesis/simulation folders inside IP directories
+**/synth/
+**/sim/
+**/hdl/
+**/doc/
+**/example_design/
+**/demo_tb/
+
+# ============================================================
+# Archives and editor/OS files
+# ============================================================
+
+*.7z
+*.zip
+*.rar
+*.tar
+*.gz
+
+*.freqbk
+*~
+*.swp
+*.swo
+
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
