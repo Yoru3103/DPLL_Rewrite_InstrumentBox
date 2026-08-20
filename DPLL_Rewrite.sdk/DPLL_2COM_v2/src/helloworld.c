@@ -12,6 +12,7 @@
 #include "xscugic.h"
 #include "xuartps.h"
 #include "xuartps_hw.h"
+#include "xtime_l.h"
 
 XUartPs XUartPs_uart0;
 XUartPs XUartPs_uart1;
@@ -45,7 +46,7 @@ void XPS_Core_init(void)
 void Write_PLL_Data_From_EEPROM(void)
 {
 	u32 data;
-	Xil_Out32(DAC0_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+8]));//ÖĞĞÄÆµÂÊ
+	Xil_Out32(DAC0_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+8]));//ä¸­å¿ƒé¢‘ç‡
 	Xil_Out32(VOC_Fre_Mul_Addr,*((uint16_t*)&STM8_EEPROM_Data[4+8]));//MUL
 	Xil_Out32(VOC_Fre_Div_Addr,*((uint16_t*)&STM8_EEPROM_Data[6+8]));//DIV
     Xil_Out32(PLL0_PID_GainP_Addr,*((uint32_t*)&STM8_EEPROM_Data[8+8]));
@@ -53,9 +54,9 @@ void Write_PLL_Data_From_EEPROM(void)
     Xil_Out32(PLL0_PID_GainI2_Addr,*((uint32_t*)&STM8_EEPROM_Data[16+8]));
     Xil_Out32(PLL0_PID_GainD_Addr,*((uint32_t*)&STM8_EEPROM_Data[20+8]));
     data = *((uint16_t*)&STM8_EEPROM_Data[24+8]);
-    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
     data = *((uint16_t*)&STM8_EEPROM_Data[26+8]);
-    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
     Xil_Out32(DAC0_Freq_Residuals_Threshold_Addr,*((uint16_t*)&STM8_EEPROM_Data[28+8]));//14Bit
     Xil_Out32(DAC0_Phase_Residuals_Threshold_Addr,*((uint16_t*)&STM8_EEPROM_Data[30+8]));//32Bit
     Xil_Out32(DAC0_VOC_Amplitude_Addr,*((uint16_t*)&STM8_EEPROM_Data[32+8]));//amplitude 15bit;
@@ -112,6 +113,8 @@ void Write_PLL_Data_From_EEPROM(void)
 #define PC_CMD_FREQMETER_TIMER				0x94
 #define PC_CMD_FREQMETER_TRIG				0x95
 #define PC_CMD_FREQMETER_RESET	 			0x96
+#define PC_CMD_AUTOTUNE_FREQ_METER		0x97
+#define PC_CMD_AUTOTUNE_DPLL			0x98
 
 #define PC_CMD_VBIAS_WRITE_DAC	 			0x9A
 
@@ -124,6 +127,7 @@ uint32_t Uart0_RX_Num;
 uint8_t PC_HOST_CMD_ASK;
 uint8_t PC_HOST_CMD_GET;
 uint8_t PC_HOST_CMD_RX_Mark = 0;
+uint8_t PC_HOST_CMD_data_Size = 0;
 uint64_t Freq_meter_gate_time_cache = 0;
 
 void PC_HOST_CMD_Get(void);
@@ -159,14 +163,14 @@ void Uart0PS_Init(void)
 
 	int status;
 
-	XUartPs_Config_uart0 = XUartPs_LookupConfig(XPAR_PS7_UART_0_DEVICE_ID);//»ñµÃ´®¿Ú1ÅäÖÃĞÅÏ¢
+	XUartPs_Config_uart0 = XUartPs_LookupConfig(XPAR_PS7_UART_0_DEVICE_ID);//è·å¾—ä¸²å£1é…ç½®ä¿¡æ¯
 	status = XUartPs_CfgInitialize(&XUartPs_uart0,XUartPs_Config_uart0,XUartPs_Config_uart0->BaseAddress);
 	if(status != XST_SUCCESS)
 	{
 		print("Initialize uart1 fail\n");
 	}
 	XUartPs_SetOperMode(&XUartPs_uart0, XUARTPS_OPER_MODE_NORMAL);
-	XUartPsFormat_uart0.BaudRate = 921600;//²¨ÌØÂÊ921600
+	XUartPsFormat_uart0.BaudRate = 921600;//æ³¢ç‰¹ç‡921600
 	XUartPsFormat_uart0.DataBits = XUARTPS_FORMAT_8_BITS;
 	XUartPsFormat_uart0.Parity = XUARTPS_FORMAT_NO_PARITY;
 	XUartPsFormat_uart0.StopBits = XUARTPS_FORMAT_1_STOP_BIT;
@@ -177,11 +181,11 @@ void Uart0PS_Init(void)
 	}
 	XUartPs_SetFifoThreshold(&XUartPs_uart0,32);
 	XUartPs_SetRecvTimeout(&XUartPs_uart0,4);//4*4=16 timeout IXR
-	XUartPs_SetInterruptMask(&XUartPs_uart0,XUARTPS_IXR_RXOVR|XUARTPS_IXR_TOUT);//¿ªÖĞ¶Ï
+	XUartPs_SetInterruptMask(&XUartPs_uart0,XUARTPS_IXR_RXOVR|XUARTPS_IXR_TOUT);//å¼€ä¸­æ–­
 
 	XScuGic_Disable(&XPS_XScuGic,XPS_UART0_INT_ID);
 	//XScuGic_SetPriorityTriggerType(&XPS_XScuGic,XPS_UART0_INT_ID,16,1);
-	XScuGic_Connect(&XPS_XScuGic,XPS_UART0_INT_ID,(Xil_ExceptionHandler)Uart0_Handler,(void *)&XUartPs_uart0);//Èë¿Ú
+	XScuGic_Connect(&XPS_XScuGic,XPS_UART0_INT_ID,(Xil_ExceptionHandler)Uart0_Handler,(void *)&XUartPs_uart0);//å…¥å£
 	XScuGic_Enable(&XPS_XScuGic,XPS_UART0_INT_ID);
 
 	Uart0_RX_Num=0;
@@ -254,12 +258,545 @@ void PC_HOST_CMD_Get(void)
 		return;
 	}
 	PC_HOST_CMD_GET = Uart0_RX_Buff[2];
-	if(Uart0_RX_Buff[3]>1)
+	PC_HOST_CMD_data_Size = Uart0_RX_Buff[3];
+	if(Uart0_RX_Buff[3]>0)
 	for(i=0;i<Uart0_RX_Num;i++)
 	{
 		PC_HOST_CMD_data_Buff[i] = Uart0_RX_Buff[i];
 	}
 	PC_HOST_CMD_ASK = 0x00;
+}
+
+/* Stage 1 adaptive-loop framework.  Candidate tables are introduced in Stage 2. */
+#define AUTOTUNE_PROTOCOL_VERSION       1U
+#define AUTOTUNE_SERVICE_PERIOD_MS      50U
+#define AUTOTUNE_BASELINE_TIME_MS       500U
+#define AUTOTUNE_VERIFY_TIME_MS         500U
+#define AUTOTUNE_PROFILE_BASELINE       0U
+#define AUTOTUNE_PROFILE_NONE           0xFFU
+
+typedef enum {
+	AUTOTUNE_TARGET_FREQ = 0,
+	AUTOTUNE_TARGET_DPLL = 1
+} AutotuneTarget;
+
+typedef enum {
+	AUTOTUNE_ACTION_QUERY = 0,
+	AUTOTUNE_ACTION_START = 1,
+	AUTOTUNE_ACTION_CANCEL = 2,
+	AUTOTUNE_ACTION_CLEAR = 3,
+	AUTOTUNE_ACTION_SET_POLICY = 4
+} AutotuneAction;
+
+typedef enum {
+	AUTOTUNE_POLICY_HOST_ONLY = 0,
+	AUTOTUNE_POLICY_BOOT_ONCE = 1,
+	AUTOTUNE_POLICY_BOOT_AND_RECOVER = 2
+} AutotunePolicy;
+
+typedef enum {
+	AUTOTUNE_EXEC_IDLE = 0,
+	AUTOTUNE_EXEC_PRECHECK = 1,
+	AUTOTUNE_EXEC_BASELINE = 2,
+	AUTOTUNE_EXEC_APPLY_CANDIDATE = 3,
+	AUTOTUNE_EXEC_SETTLE = 4,
+	AUTOTUNE_EXEC_EVALUATE = 5,
+	AUTOTUNE_EXEC_NEXT_CANDIDATE = 6,
+	AUTOTUNE_EXEC_SELECT_BEST = 7,
+	AUTOTUNE_EXEC_APPLY_BEST = 8,
+	AUTOTUNE_EXEC_VERIFY = 9,
+	AUTOTUNE_EXEC_ROLLBACK = 10,
+	AUTOTUNE_EXEC_DONE = 11,
+	AUTOTUNE_EXEC_FAILED = 12,
+	AUTOTUNE_EXEC_CANCELED = 13
+} AutotuneExecState;
+
+typedef enum {
+	AUTOTUNE_HEALTH_UNINITIALIZED = 0,
+	AUTOTUNE_HEALTH_VALID = 1,
+	AUTOTUNE_HEALTH_DEGRADED = 2,
+	AUTOTUNE_HEALTH_LOST = 3,
+	AUTOTUNE_HEALTH_RETUNE_PENDING = 4,
+	AUTOTUNE_HEALTH_FAULT = 5
+} AutotuneHealthState;
+
+typedef enum {
+	AUTOTUNE_RESULT_NONE = 0,
+	AUTOTUNE_RESULT_SUCCESS = 1,
+	AUTOTUNE_RESULT_ACCEPTED = 2,
+	AUTOTUNE_RESULT_BUSY = 3,
+	AUTOTUNE_RESULT_REJECTED = 4,
+	AUTOTUNE_RESULT_INVALID_ACTION = 5,
+	AUTOTUNE_RESULT_INVALID_POLICY = 6,
+	AUTOTUNE_RESULT_NOT_LOCKED = 7,
+	AUTOTUNE_RESULT_READBACK_ERROR = 8,
+	AUTOTUNE_RESULT_CANCELED = 9
+} AutotuneResult;
+
+typedef struct {
+	u32 kp;
+	u32 ki;
+	u32 kii;
+	u32 kd;
+	u32 dCoeff;
+} AutotuneProfile;
+
+typedef struct {
+	u64 amplitudeSum;
+	u64 absFreqSum;
+	u64 absPhaseSum;
+	u32 amplitudeMin;
+	u32 amplitudeMax;
+	u32 sampleCount;
+	u32 lockedCount;
+} AutotuneMetrics;
+
+typedef struct {
+	AutotuneTarget target;
+	AutotunePolicy policy;
+	AutotuneExecState execState;
+	AutotuneHealthState healthState;
+	AutotuneResult result;
+	AutotuneProfile originalProfile;
+	AutotuneMetrics metrics;
+	u32 originalManualOffset;
+	u32 runStartMs;
+	u32 stateStartMs;
+	u32 lastServiceMs;
+	u16 currentScore;
+	u16 bestScore;
+	u8 runId;
+	u8 progress;
+	u8 currentProfileId;
+	u8 activeProfileId;
+	u8 bestProfileId;
+	u8 done;
+	u8 busy;
+	u8 failed;
+	u8 paramsValid;
+	u8 lockValid;
+	u8 retunePending;
+	u8 cancelRequested;
+	u8 originalProfileValid;
+} AutotuneContext;
+
+static AutotuneContext FreqAutotune;
+static AutotuneContext DpllAutotune;
+static AutotuneContext *AutotuneOwner = NULL;
+
+static u32 Autotune_Millis(void)
+{
+	XTime now;
+	XTime_GetTime(&now);
+	return (u32)(now / (COUNTS_PER_SECOND / 1000U));
+}
+
+static u32 Autotune_Elapsed(u32 now, u32 start)
+{
+	return now - start;
+}
+
+static u32 Autotune_Abs32(s32 value)
+{
+	if(value >= 0) return (u32)value;
+	return (u32)(-(value + 1)) + 1U;
+}
+
+static s32 Autotune_SignExtend14(u32 value)
+{
+	value &= 0x3FFFU;
+	if((value & 0x2000U) != 0U) value |= 0xFFFFC000U;
+	return (s32)value;
+}
+
+static u32 Autotune_LockAddr(const AutotuneContext *ctx)
+{
+	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_Lock_Ctrl_Addr : PLL0_Lock_Ctrl_Addr;
+}
+
+static u32 Autotune_ManualOffsetAddr(const AutotuneContext *ctx)
+{
+	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_Freq_Manual_Offset_Addr : VCO_Freq_Manual_Offset_Addr;
+}
+
+static u32 Autotune_StatusRegister(const AutotuneContext *ctx)
+{
+	return Xil_In32((ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_System_Statue_Addr : System_Statue);
+}
+
+static void Autotune_ReadProfile(const AutotuneContext *ctx, AutotuneProfile *profile)
+{
+	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
+		profile->kp = Xil_In32(Freq_Meter_PID_GainP_Addr);
+		profile->ki = Xil_In32(Freq_Meter_PID_GainI_Addr);
+		profile->kii = Xil_In32(Freq_Meter_PID_GainI2_Addr);
+		profile->kd = Xil_In32(Freq_Meter_PID_GainD_Addr);
+		profile->dCoeff = Xil_In32(Freq_Meter_Coefd_Filter_Addr);
+	} else {
+		profile->kp = Xil_In32(PLL0_PID_GainP_Addr);
+		profile->ki = Xil_In32(PLL0_PID_GainI_Addr);
+		profile->kii = Xil_In32(PLL0_PID_GainI2_Addr);
+		profile->kd = Xil_In32(PLL0_PID_GainD_Addr);
+		profile->dCoeff = Xil_In32(PLL0_Coefd_Filter_Addr);
+	}
+}
+
+static int Autotune_ProfileEqual(const AutotuneProfile *left, const AutotuneProfile *right)
+{
+	return left->kp == right->kp && left->ki == right->ki && left->kii == right->kii &&
+		left->kd == right->kd && left->dCoeff == right->dCoeff;
+}
+
+/* Scheme B transaction: only the selected loop is unlocked and all fields are verified. */
+static int Autotune_ApplyProfile(AutotuneContext *ctx, const AutotuneProfile *profile)
+{
+	AutotuneProfile active;
+	Autotune_ReadProfile(ctx, &active);
+	if(Autotune_ProfileEqual(&active, profile)) return 1;
+
+	ctx->originalManualOffset = Xil_In32(Autotune_ManualOffsetAddr(ctx));
+	Xil_Out32(Autotune_LockAddr(ctx), 0U);
+	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
+		Xil_Out32(Freq_Meter_PID_GainP_Addr, profile->kp);
+		Xil_Out32(Freq_Meter_PID_GainI_Addr, profile->ki);
+		Xil_Out32(Freq_Meter_PID_GainI2_Addr, profile->kii);
+		Xil_Out32(Freq_Meter_PID_GainD_Addr, profile->kd);
+		Xil_Out32(Freq_Meter_Coefd_Filter_Addr, profile->dCoeff);
+	} else {
+		Xil_Out32(PLL0_PID_GainP_Addr, profile->kp);
+		Xil_Out32(PLL0_PID_GainI_Addr, profile->ki);
+		Xil_Out32(PLL0_PID_GainI2_Addr, profile->kii);
+		Xil_Out32(PLL0_PID_GainD_Addr, profile->kd);
+		Xil_Out32(PLL0_Coefd_Filter_Addr, profile->dCoeff);
+	}
+	Autotune_ReadProfile(ctx, &active);
+	Xil_Out32(Autotune_ManualOffsetAddr(ctx), ctx->originalManualOffset);
+	Xil_Out32(Autotune_LockAddr(ctx), 1U);
+	return Autotune_ProfileEqual(&active, profile);
+}
+
+static void Autotune_ResetMetrics(AutotuneMetrics *metrics)
+{
+	metrics->amplitudeSum = 0U;
+	metrics->absFreqSum = 0U;
+	metrics->absPhaseSum = 0U;
+	metrics->amplitudeMin = 0xFFFFFFFFU;
+	metrics->amplitudeMax = 0U;
+	metrics->sampleCount = 0U;
+	metrics->lockedCount = 0U;
+}
+
+static void Autotune_Sample(AutotuneContext *ctx)
+{
+	u32 amplitude;
+	u32 frequency;
+	u32 phase;
+	u32 status;
+	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
+		amplitude = Xil_In32(Freq_Meter_Amplitude_Addr) & 0xFFFFU;
+		frequency = Xil_In32(Freq_Meter_inst_frequency_Addr);
+		phase = Xil_In32(Freq_Meter_PLL_phase_residuals_Addr);
+	} else {
+		amplitude = Xil_In32(DDC0_Amplitude) & 0xFFFFU;
+		frequency = Xil_In32(DDC0_inst_frequency);
+		phase = Xil_In32(PLL0_phase_residuals);
+	}
+	status = Autotune_StatusRegister(ctx);
+	ctx->metrics.amplitudeSum += amplitude;
+	ctx->metrics.absFreqSum += Autotune_Abs32(Autotune_SignExtend14(frequency));
+	ctx->metrics.absPhaseSum += Autotune_Abs32((s32)phase);
+	if(amplitude < ctx->metrics.amplitudeMin) ctx->metrics.amplitudeMin = amplitude;
+	if(amplitude > ctx->metrics.amplitudeMax) ctx->metrics.amplitudeMax = amplitude;
+	ctx->metrics.sampleCount++;
+	if((status & 0x3FU) == 0x30U) ctx->metrics.lockedCount++;
+}
+
+static u16 Autotune_Score(const AutotuneMetrics *metrics)
+{
+	u64 score;
+	if(metrics->sampleCount == 0U) return 0xFFFFU;
+	score = metrics->absFreqSum / metrics->sampleCount;
+	score += (metrics->absPhaseSum / metrics->sampleCount) >> 10;
+	score += ((u64)(metrics->sampleCount - metrics->lockedCount) * 1000U) / metrics->sampleCount;
+	return (score > 0xFFFFU) ? 0xFFFFU : (u16)score;
+}
+
+static void Autotune_SetState(AutotuneContext *ctx, AutotuneExecState state, u32 now)
+{
+	ctx->execState = state;
+	ctx->stateStartMs = now;
+}
+
+static void Autotune_ReleaseOwner(AutotuneContext *ctx)
+{
+	if(AutotuneOwner == ctx) AutotuneOwner = NULL;
+	ctx->busy = 0U;
+}
+
+static void Autotune_Fail(AutotuneContext *ctx, AutotuneResult result, u32 now)
+{
+	ctx->done = 0U;
+	ctx->failed = 1U;
+	ctx->paramsValid = 0U;
+	ctx->result = result;
+	ctx->healthState = (result == AUTOTUNE_RESULT_READBACK_ERROR) ? AUTOTUNE_HEALTH_FAULT : AUTOTUNE_HEALTH_LOST;
+	Autotune_SetState(ctx, AUTOTUNE_EXEC_FAILED, now);
+	Autotune_ReleaseOwner(ctx);
+}
+
+static u32 Autotune_StatusWord(const AutotuneContext *ctx, AutotuneResult responseResult)
+{
+	u32 status = 0U;
+	AutotuneResult result = (responseResult == (AutotuneResult)0xFF) ? ctx->result : responseResult;
+	status |= ctx->done ? (1U << 0) : 0U;
+	status |= ctx->busy ? (1U << 1) : 0U;
+	status |= ctx->failed ? (1U << 2) : 0U;
+	status |= ctx->paramsValid ? (1U << 3) : 0U;
+	status |= ctx->lockValid ? (1U << 4) : 0U;
+	status |= ctx->retunePending ? (1U << 5) : 0U;
+	status |= (ctx->policy == AUTOTUNE_POLICY_BOOT_AND_RECOVER) ? (1U << 6) : 0U;
+	status |= (ctx->policy != AUTOTUNE_POLICY_HOST_ONLY) ? (1U << 7) : 0U;
+	status |= ((u32)ctx->execState & 0x0FU) << 8;
+	status |= ((u32)ctx->healthState & 0x0FU) << 12;
+	status |= ((u32)result & 0xFFU) << 16;
+	status |= ((u32)ctx->runId) << 24;
+	return status;
+}
+
+static u8 Autotune_Ready(const AutotuneContext *ctx)
+{
+	return ctx->done && ctx->paramsValid && ctx->lockValid;
+}
+
+static void Autotune_SendResponse(AutotuneContext *ctx, u8 action, AutotuneResult responseResult)
+{
+	u32 status = Autotune_StatusWord(ctx, responseResult);
+	u32 elapsed = ctx->runStartMs ? Autotune_Elapsed(Autotune_Millis(), ctx->runStartMs) : 0U;
+	Uart0_TX_Buff[4] = AUTOTUNE_PROTOCOL_VERSION;
+	Uart0_TX_Buff[5] = action;
+	Uart0_TX_Buff[6] = status & 0xFFU;
+	Uart0_TX_Buff[7] = (status >> 8) & 0xFFU;
+	Uart0_TX_Buff[8] = (status >> 16) & 0xFFU;
+	Uart0_TX_Buff[9] = (status >> 24) & 0xFFU;
+	Uart0_TX_Buff[10] = ctx->progress;
+	Uart0_TX_Buff[11] = ctx->currentProfileId;
+	Uart0_TX_Buff[12] = ctx->activeProfileId;
+	Uart0_TX_Buff[13] = ctx->bestProfileId;
+	Uart0_TX_Buff[14] = ctx->currentScore & 0xFFU;
+	Uart0_TX_Buff[15] = (ctx->currentScore >> 8) & 0xFFU;
+	Uart0_TX_Buff[16] = ctx->bestScore & 0xFFU;
+	Uart0_TX_Buff[17] = (ctx->bestScore >> 8) & 0xFFU;
+	Uart0_TX_Buff[18] = elapsed & 0xFFU;
+	Uart0_TX_Buff[19] = (elapsed >> 8) & 0xFFU;
+	Uart0_TX_Buff[20] = (elapsed >> 16) & 0xFFU;
+	Uart0_TX_Buff[21] = (elapsed >> 24) & 0xFFU;
+	PC_HOST_ASK_Pack(18);
+}
+
+static void Autotune_Start(AutotuneContext *ctx, u32 now)
+{
+	ctx->runId++;
+	ctx->done = 0U;
+	ctx->failed = 0U;
+	ctx->busy = 1U;
+	ctx->retunePending = 0U;
+	ctx->cancelRequested = 0U;
+	ctx->originalProfileValid = 0U;
+	ctx->result = AUTOTUNE_RESULT_ACCEPTED;
+	ctx->progress = 1U;
+	ctx->currentProfileId = AUTOTUNE_PROFILE_BASELINE;
+	ctx->bestProfileId = AUTOTUNE_PROFILE_NONE;
+	ctx->currentScore = 0xFFFFU;
+	ctx->bestScore = 0xFFFFU;
+	ctx->runStartMs = now;
+	Autotune_ResetMetrics(&ctx->metrics);
+	AutotuneOwner = ctx;
+	Autotune_SetState(ctx, AUTOTUNE_EXEC_PRECHECK, now);
+}
+
+static void Autotune_Command(AutotuneContext *ctx)
+{
+	u8 action = (PC_HOST_CMD_data_Size >= 1U) ? PC_HOST_CMD_data_Buff[4] : 0xFFU;
+	u32 now = Autotune_Millis();
+	AutotuneResult response = (AutotuneResult)0xFF;
+
+	switch(action) {
+	case AUTOTUNE_ACTION_QUERY:
+		break;
+	case AUTOTUNE_ACTION_START:
+		if(ctx->busy || (AutotuneOwner != NULL && AutotuneOwner != ctx)) {
+			response = AUTOTUNE_RESULT_BUSY;
+		} else {
+			Autotune_Start(ctx, now);
+		}
+		break;
+	case AUTOTUNE_ACTION_CANCEL:
+		if(ctx->busy) ctx->cancelRequested = 1U;
+		else response = AUTOTUNE_RESULT_REJECTED;
+		break;
+	case AUTOTUNE_ACTION_CLEAR:
+		if(ctx->busy) {
+			response = AUTOTUNE_RESULT_BUSY;
+		} else {
+			ctx->done = 0U;
+			ctx->failed = 0U;
+			ctx->result = AUTOTUNE_RESULT_NONE;
+			ctx->progress = 0U;
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_IDLE, now);
+		}
+		break;
+	case AUTOTUNE_ACTION_SET_POLICY:
+		if(ctx->busy) {
+			response = AUTOTUNE_RESULT_BUSY;
+		} else if(PC_HOST_CMD_data_Size < 2U || PC_HOST_CMD_data_Buff[5] > AUTOTUNE_POLICY_BOOT_AND_RECOVER) {
+			response = AUTOTUNE_RESULT_INVALID_POLICY;
+		} else {
+			ctx->policy = (AutotunePolicy)PC_HOST_CMD_data_Buff[5];
+		}
+		break;
+	default:
+		response = AUTOTUNE_RESULT_INVALID_ACTION;
+		break;
+	}
+	Autotune_SendResponse(ctx, action, response);
+}
+
+static void Autotune_Task(AutotuneContext *ctx, u32 now)
+{
+	if(Autotune_Elapsed(now, ctx->lastServiceMs) < AUTOTUNE_SERVICE_PERIOD_MS) return;
+	ctx->lastServiceMs = now;
+
+	if(ctx->paramsValid && !ctx->busy) {
+		ctx->lockValid = ((Autotune_StatusRegister(ctx) & 0x3FU) == 0x30U);
+		ctx->healthState = ctx->lockValid ? AUTOTUNE_HEALTH_VALID : AUTOTUNE_HEALTH_LOST;
+		if(!ctx->lockValid && ctx->policy == AUTOTUNE_POLICY_BOOT_AND_RECOVER) ctx->retunePending = 1U;
+	}
+	if(!ctx->busy) return;
+	if(ctx->cancelRequested && ctx->execState != AUTOTUNE_EXEC_ROLLBACK) {
+		Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+	}
+
+	switch(ctx->execState) {
+	case AUTOTUNE_EXEC_PRECHECK:
+		Autotune_ReadProfile(ctx, &ctx->originalProfile);
+		ctx->originalManualOffset = Xil_In32(Autotune_ManualOffsetAddr(ctx));
+		ctx->originalProfileValid = 1U;
+		if((Autotune_StatusRegister(ctx) & 0x20U) == 0U) {
+			Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
+			break;
+		}
+		ctx->progress = 10U;
+		Autotune_ResetMetrics(&ctx->metrics);
+		Autotune_SetState(ctx, AUTOTUNE_EXEC_BASELINE, now);
+		break;
+	case AUTOTUNE_EXEC_BASELINE:
+		Autotune_Sample(ctx);
+		ctx->progress = 10U + (u8)((Autotune_Elapsed(now, ctx->stateStartMs) * 35U) / AUTOTUNE_BASELINE_TIME_MS);
+		if(Autotune_Elapsed(now, ctx->stateStartMs) >= AUTOTUNE_BASELINE_TIME_MS) {
+			ctx->currentScore = Autotune_Score(&ctx->metrics);
+			if(ctx->metrics.sampleCount < 3U || ctx->metrics.lockedCount * 2U < ctx->metrics.sampleCount) {
+				Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
+			} else {
+				ctx->bestScore = ctx->currentScore;
+				ctx->bestProfileId = AUTOTUNE_PROFILE_BASELINE;
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_SELECT_BEST, now);
+			}
+		}
+		break;
+	case AUTOTUNE_EXEC_SELECT_BEST:
+		ctx->progress = 50U;
+		Autotune_SetState(ctx, AUTOTUNE_EXEC_APPLY_BEST, now);
+		break;
+	case AUTOTUNE_EXEC_APPLY_BEST:
+		if(!Autotune_ApplyProfile(ctx, &ctx->originalProfile)) {
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+		} else {
+			ctx->activeProfileId = AUTOTUNE_PROFILE_BASELINE;
+			ctx->progress = 60U;
+			Autotune_ResetMetrics(&ctx->metrics);
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_VERIFY, now);
+		}
+		break;
+	case AUTOTUNE_EXEC_VERIFY:
+		Autotune_Sample(ctx);
+		ctx->progress = 60U + (u8)((Autotune_Elapsed(now, ctx->stateStartMs) * 39U) / AUTOTUNE_VERIFY_TIME_MS);
+		if(Autotune_Elapsed(now, ctx->stateStartMs) >= AUTOTUNE_VERIFY_TIME_MS) {
+			if(ctx->metrics.sampleCount < 3U || ctx->metrics.lockedCount * 2U < ctx->metrics.sampleCount) {
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+			} else {
+				ctx->done = 1U;
+				ctx->failed = 0U;
+				ctx->paramsValid = 1U;
+				ctx->lockValid = 1U;
+				ctx->result = AUTOTUNE_RESULT_SUCCESS;
+				ctx->healthState = AUTOTUNE_HEALTH_VALID;
+				ctx->progress = 100U;
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_DONE, now);
+				Autotune_ReleaseOwner(ctx);
+			}
+		}
+		break;
+	case AUTOTUNE_EXEC_ROLLBACK:
+		if(ctx->originalProfileValid && !Autotune_ApplyProfile(ctx, &ctx->originalProfile)) {
+			Autotune_Fail(ctx, AUTOTUNE_RESULT_READBACK_ERROR, now);
+		} else if(ctx->cancelRequested) {
+			ctx->done = 0U;
+			ctx->failed = 0U;
+			ctx->result = AUTOTUNE_RESULT_CANCELED;
+			ctx->progress = 0U;
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_CANCELED, now);
+			Autotune_ReleaseOwner(ctx);
+		} else {
+			Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void Autotune_InitContext(AutotuneContext *ctx, AutotuneTarget target)
+{
+	u32 now = Autotune_Millis();
+	ctx->target = target;
+	ctx->policy = AUTOTUNE_POLICY_HOST_ONLY;
+	ctx->execState = AUTOTUNE_EXEC_IDLE;
+	ctx->healthState = AUTOTUNE_HEALTH_UNINITIALIZED;
+	ctx->result = AUTOTUNE_RESULT_NONE;
+	ctx->runId = 0U;
+	ctx->progress = 0U;
+	ctx->currentProfileId = AUTOTUNE_PROFILE_NONE;
+	ctx->activeProfileId = AUTOTUNE_PROFILE_NONE;
+	ctx->bestProfileId = AUTOTUNE_PROFILE_NONE;
+	ctx->currentScore = 0xFFFFU;
+	ctx->bestScore = 0xFFFFU;
+	ctx->done = ctx->busy = ctx->failed = 0U;
+	ctx->paramsValid = ctx->lockValid = ctx->retunePending = ctx->cancelRequested = 0U;
+	ctx->originalProfileValid = 0U;
+	ctx->runStartMs = ctx->stateStartMs = ctx->lastServiceMs = now;
+	Autotune_ResetMetrics(&ctx->metrics);
+}
+
+static void Autotune_Init(void)
+{
+	AutotuneOwner = NULL;
+	Autotune_InitContext(&FreqAutotune, AUTOTUNE_TARGET_FREQ);
+	Autotune_InitContext(&DpllAutotune, AUTOTUNE_TARGET_DPLL);
+}
+
+static void Autotune_Service(void)
+{
+	u32 now = Autotune_Millis();
+	Autotune_Task(&FreqAutotune, now);
+	Autotune_Task(&DpllAutotune, now);
+}
+
+static void Autotune_ManualOverride(AutotuneContext *ctx)
+{
+	ctx->paramsValid = 0U;
+	ctx->retunePending = 0U;
+	ctx->activeProfileId = AUTOTUNE_PROFILE_NONE;
+	ctx->healthState = AUTOTUNE_HEALTH_UNINITIALIZED;
 }
 
 void CMD_01_READ_MWS_SETTING(void)
@@ -399,6 +936,8 @@ void CMD_09_PLL_STATUS(void)
 	i = Xil_In32(System_Statue);
 	data = i&0x3F;
 	Uart0_TX_Buff[14] = PLL_Lock_Status|data;
+	if(Autotune_Ready(&DpllAutotune)) Uart0_TX_Buff[14] |= 0x80U;
+	if(DpllAutotune.busy) Uart0_TX_Buff[14] |= 0x40U;
 
 	PC_HOST_ASK_Pack(11);
 }
@@ -521,6 +1060,8 @@ void CMD_14_READ_FREQMETER_STATUS(void)
 	i = Xil_In32(Freq_Meter_System_Statue_Addr);
 	data = i&0x3F;
 	Uart0_TX_Buff[10] = 0x20|data;
+	if(Autotune_Ready(&FreqAutotune)) Uart0_TX_Buff[10] |= 0x80U;
+	if(FreqAutotune.busy) Uart0_TX_Buff[10] |= 0x40U;
 
 	PC_HOST_ASK_Pack(7);
 }
@@ -636,7 +1177,7 @@ void CMD_81_WRITE_MWS_FREQ_PWR(void)
 void CMD_82_WRITE_PLL_FREQ(void)
 {
 	*((uint32_t*)&STM8_EEPROM_Data[0+8]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[4]);
-	Xil_Out32(DAC0_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+8]));//ÖĞĞÄÆµÂÊ
+	Xil_Out32(DAC0_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+8]));//ä¸­å¿ƒé¢‘ç‡
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_83_WRITE_PLL_MUL_DIV(void)
@@ -659,16 +1200,20 @@ void CMD_85_WRITE_PLL_LIMIT(void)
 	data = *((uint16_t*)&PC_HOST_CMD_data_Buff[4]);
 	if(data > 0x7FFF) data = 0x7FFF;
 	*((uint16_t*)&STM8_EEPROM_Data[24+8]) = data;
-    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
 
 	data = *((uint16_t*)&PC_HOST_CMD_data_Buff[6]);
 	if(data < 0x8000) data = 0x8000;
 	*((uint16_t*)&STM8_EEPROM_Data[26+8]) = data;
-    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_86_WRITE_PLL_PID(void)
 {
+	if(DpllAutotune.busy) {
+		PC_HOST_Send_ASK_Only(AUTOTUNE_RESULT_BUSY);
+		return;
+	}
 	*((uint32_t*)&STM8_EEPROM_Data[8+8]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[4]);
 	*((uint32_t*)&STM8_EEPROM_Data[12+8]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[8]);
 	*((uint32_t*)&STM8_EEPROM_Data[16+8]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[12]);
@@ -677,6 +1222,7 @@ void CMD_86_WRITE_PLL_PID(void)
     Xil_Out32(PLL0_PID_GainI_Addr,*((uint32_t*)&STM8_EEPROM_Data[12+8]));
     Xil_Out32(PLL0_PID_GainI2_Addr,*((uint32_t*)&STM8_EEPROM_Data[16+8]));
     Xil_Out32(PLL0_PID_GainD_Addr,*((uint32_t*)&STM8_EEPROM_Data[20+8]));
+	Autotune_ManualOverride(&DpllAutotune);
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_87_WRITE_PLL_AMP(void)
@@ -700,8 +1246,13 @@ void CMD_89_WRITE_MWS_OFF(void)
 void CMD_8C_LOAD_EEPROM(void)
 {
 	uint32_t Error_Code;
+	if(DpllAutotune.busy) {
+		PC_HOST_Send_ASK_Only(AUTOTUNE_RESULT_BUSY);
+		return;
+	}
 	Error_Code = Uart1_STM8_Read_EEPROM();
 	Write_PLL_Data_From_EEPROM();
+	Autotune_ManualOverride(&DpllAutotune);
 	PC_HOST_Send_ASK_Only(Error_Code);
 }
 void CMD_8D_SAVE_EEPROM(void)
@@ -714,7 +1265,7 @@ void CMD_8D_SAVE_EEPROM(void)
 void CMD_90_WRITE_FREQMETER_FREQ(void)
 {
 	*((uint32_t*)&STM8_EEPROM_Data[0+44]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[4]);
-	Xil_Out32(Freq_Meter_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+44]));//ÖĞĞÄÆµÂÊ
+	Xil_Out32(Freq_Meter_Centre_Frequency_Addr,*((uint32_t*)&STM8_EEPROM_Data[0+44]));//ä¸­å¿ƒé¢‘ç‡
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_91_WRITE_FREQMETER_THRESHOLD(void)
@@ -731,24 +1282,28 @@ void CMD_92_WRITE_FREQMETER_LIMIT(void)
 	//*((uint16_t*)&STM8_EEPROM_Data[8+44]) = *((uint16_t*)&PC_HOST_CMD_data_Buff[4]);
 	//*((uint16_t*)&STM8_EEPROM_Data[10+44]) = *((uint16_t*)&PC_HOST_CMD_data_Buff[6]);
     //data = *((uint16_t*)&STM8_EEPROM_Data[8+44]);
-    //Xil_Out32(Freq_Meter_Freq_Pos_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    //Xil_Out32(Freq_Meter_Freq_Pos_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
     //data = *((uint16_t*)&STM8_EEPROM_Data[10+44]);
-    //Xil_Out32(Freq_Meter_Freq_Neg_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    //Xil_Out32(Freq_Meter_Freq_Neg_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
 
 	data = *((uint16_t*)&PC_HOST_CMD_data_Buff[4]);
 	if(data > 0x7FFF) data = 0x3FFF;
 	*((uint16_t*)&STM8_EEPROM_Data[8+44]) = data;
-    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Pos_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
 
 	data = *((uint16_t*)&PC_HOST_CMD_data_Buff[6]);
 	if(data < 0xA000) data = 0xA000;
 	*((uint16_t*)&STM8_EEPROM_Data[10+44]) = data;
-    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ÉÏÎ»»ú´¢´æºÍ´«Èë²ÎÊıÎª¸ß16bitĞ´Èëµ½FPGAÄÚ²¿Îª32Bit
+    Xil_Out32(PID_Freq_Neg_Limit_Addr,data<<16);//ä¸Šä½æœºå‚¨å­˜å’Œä¼ å…¥å‚æ•°ä¸ºé«˜16bitå†™å…¥åˆ°FPGAå†…éƒ¨ä¸º32Bit
 
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_93_WRITE_FREQMETER_PID(void)
 {
+	if(FreqAutotune.busy) {
+		PC_HOST_Send_ASK_Only(AUTOTUNE_RESULT_BUSY);
+		return;
+	}
 	*((uint32_t*)&STM8_EEPROM_Data[12+44]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[4]);
 	*((uint32_t*)&STM8_EEPROM_Data[16+44]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[8]);
 	*((uint32_t*)&STM8_EEPROM_Data[20+44]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[12]);
@@ -757,13 +1312,14 @@ void CMD_93_WRITE_FREQMETER_PID(void)
     Xil_Out32(Freq_Meter_PID_GainI_Addr,*((uint32_t*)&STM8_EEPROM_Data[16+44]));
     Xil_Out32(Freq_Meter_PID_GainI2_Addr,*((uint32_t*)&STM8_EEPROM_Data[20+44]));
     Xil_Out32(Freq_Meter_PID_GainD_Addr,*((uint32_t*)&STM8_EEPROM_Data[24+44]));
+	Autotune_ManualOverride(&FreqAutotune);
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_94_WRITE_FREQMETER_TIMER(void)
 {
 	*((uint32_t*)&STM8_EEPROM_Data[28+44]) = *((uint32_t*)&PC_HOST_CMD_data_Buff[4]);
-	Xil_Out32(Freq_Meter_Gate_Time_L_Addr,*((uint32_t*)&STM8_EEPROM_Data[28+44]));//ÖĞĞÄÆµÂÊ
-	Xil_Out32(Freq_Meter_Gate_Time_H_Addr,*((uint16_t*)&PC_HOST_CMD_data_Buff[8]));//ÖĞĞÄÆµÂÊ
+	Xil_Out32(Freq_Meter_Gate_Time_L_Addr,*((uint32_t*)&STM8_EEPROM_Data[28+44]));//ä¸­å¿ƒé¢‘ç‡
+	Xil_Out32(Freq_Meter_Gate_Time_H_Addr,*((uint16_t*)&PC_HOST_CMD_data_Buff[8]));//ä¸­å¿ƒé¢‘ç‡
 	PC_HOST_Send_ASK_Only(0);
 }
 void CMD_9A_WRITE_VBIAS_DAC(void)
@@ -931,6 +1487,12 @@ void PC_HOST_CMD_Respond(void)
 				Xil_Out32(Freq_Meter_Reset_Trigger_Addr,0);
 				Xil_Out32(Freq_Meter_Lock_Ctrl_Addr,1);
 				break;
+			case PC_CMD_AUTOTUNE_FREQ_METER:
+				Autotune_Command(&FreqAutotune);
+				break;
+			case PC_CMD_AUTOTUNE_DPLL:
+				Autotune_Command(&DpllAutotune);
+				break;
 			case PC_CMD_VBIAS_WRITE_DAC:
 				CMD_9A_WRITE_VBIAS_DAC();
 				break;
@@ -1053,14 +1615,14 @@ void Uart1PS_Init(void)
 
 	int status;
 
-	XUartPs_Config_uart1 = XUartPs_LookupConfig(XPAR_PS7_UART_1_DEVICE_ID);//»ñµÃ´®¿Ú1ÅäÖÃĞÅÏ¢
+	XUartPs_Config_uart1 = XUartPs_LookupConfig(XPAR_PS7_UART_1_DEVICE_ID);//è·å¾—ä¸²å£1é…ç½®ä¿¡æ¯
 	status = XUartPs_CfgInitialize(&XUartPs_uart1,XUartPs_Config_uart1,XUartPs_Config_uart1->BaseAddress);
 	if(status != XST_SUCCESS)
 	{
 		print("Initialize uart1 fail\n");
 	}
 	XUartPs_SetOperMode(&XUartPs_uart1, XUARTPS_OPER_MODE_NORMAL);
-	XUartPsFormat_uart1.BaudRate = 921600;//²¨ÌØÂÊ921600
+	XUartPsFormat_uart1.BaudRate = 921600;//æ³¢ç‰¹ç‡921600
 	XUartPsFormat_uart1.DataBits = XUARTPS_FORMAT_8_BITS;
 	XUartPsFormat_uart1.Parity = XUARTPS_FORMAT_NO_PARITY;
 	XUartPsFormat_uart1.StopBits = XUARTPS_FORMAT_1_STOP_BIT;
@@ -1071,14 +1633,14 @@ void Uart1PS_Init(void)
 	}
 	XUartPs_SetFifoThreshold(&XUartPs_uart1,32);
 	XUartPs_SetRecvTimeout(&XUartPs_uart1,4);//4*4=16 timeout IXR
-	XUartPs_SetInterruptMask(&XUartPs_uart1,XUARTPS_IXR_RXOVR|XUARTPS_IXR_TOUT);//¿ªÖĞ¶Ï
+	XUartPs_SetInterruptMask(&XUartPs_uart1,XUARTPS_IXR_RXOVR|XUARTPS_IXR_TOUT);//å¼€ä¸­æ–­
 
 	XScuGic_Disable(&XPS_XScuGic,XPS_UART1_INT_ID);
 	//XScuGic_SetPriorityTriggerType(&XPS_XScuGic,XPS_UART0_INT_ID,16,1);
-	XScuGic_Connect(&XPS_XScuGic,XPS_UART1_INT_ID,(Xil_ExceptionHandler)Uart1_Handler,(void *)&XUartPs_uart1);//Èë¿Ú
+	XScuGic_Connect(&XPS_XScuGic,XPS_UART1_INT_ID,(Xil_ExceptionHandler)Uart1_Handler,(void *)&XUartPs_uart1);//å…¥å£
 	XScuGic_Enable(&XPS_XScuGic,XPS_UART1_INT_ID);
 
-	Uart1_RX_Buff_Pointer = Uart1_RX_Buff;//ÉèÖÃÄ¬ÈÏÎ»ÖÃ ÒÔ·ÀÉÏµç³öÏÖÆæ¹ÖÎÊÌâ
+	Uart1_RX_Buff_Pointer = Uart1_RX_Buff;//è®¾ç½®é»˜è®¤ä½ç½® ä»¥é˜²ä¸Šç”µå‡ºç°å¥‡æ€ªé—®é¢˜
 	Uart1_RX_Num=0;
 }
 
@@ -1245,7 +1807,7 @@ int main()
     Xil_Out32(DAC0_VCO_Offset_Addr,0);//offset 14bit;
     Xil_Out32(DAC0_VOC_Amplitude_Addr,0x7fff);//amplitude 15bit;
     //Xil_Out32(DAC0_VOC_Amplitude_Addr,0x0001);//amplitude 15bit;
-    Xil_Out32(DAC0_Centre_Frequency_Addr,0x051EB851);//ÖĞĞÄÆµÂÊ 120KHz@fs=3.125MHz
+    Xil_Out32(DAC0_Centre_Frequency_Addr,0x051EB851);//ä¸­å¿ƒé¢‘ç‡ 120KHz@fs=3.125MHz
 
     Xil_Out32(DAC0_DDC_Angle_Select_Addr,0);//wrapped_phase_cordic
 
@@ -1269,12 +1831,12 @@ int main()
 
     //Xil_Out32(PLL0_PID_GainP_Addr,1100000);
     //Xil_Out32(PLL0_PID_GainI_Addr,5000000);
-    //Xil_Out32(PLL0_PID_GainI2_Addr,5000000);//¼õÉÙ²Ğ²î ¼Ó¿ì×îºóµÄÂıÊÕÁ²
+    //Xil_Out32(PLL0_PID_GainI2_Addr,5000000);//å‡å°‘æ®‹å·® åŠ å¿«æœ€åçš„æ…¢æ”¶æ•›
     //Xil_Out32(PLL0_PID_GainD_Addr,100000000);
 
     Xil_Out32(PLL0_PID_GainP_Addr,1100000);
     Xil_Out32(PLL0_PID_GainI_Addr,1000000);
-    Xil_Out32(PLL0_PID_GainI2_Addr,1000000);//¼õÉÙ²Ğ²î ¼Ó¿ì×îºóµÄÂıÊÕÁ²
+    Xil_Out32(PLL0_PID_GainI2_Addr,1000000);//å‡å°‘æ®‹å·® åŠ å¿«æœ€åçš„æ…¢æ”¶æ•›
     Xil_Out32(PLL0_PID_GainD_Addr,80000000);
 
     //Xil_Out32(PLL0_PID_GainP_Addr,0x07000000);
@@ -1306,13 +1868,15 @@ int main()
     Xil_Out32(Freq_Meter_Freq_Residuals_Threshold_Addr,500);
 	usleep(50);
 
-    Xil_Out32(Freq_Meter_Lock_Ctrl_Addr,1);
+	Xil_Out32(Freq_Meter_Lock_Ctrl_Addr,1);
+	Autotune_Init();
 
-    XUartPs_SendByte(XUartPs_uart0.Config.BaseAddress,'C');
+	XUartPs_SendByte(XUartPs_uart0.Config.BaseAddress,'C');
 
     while(1)
     {
     	PC_HOST_CMD_Respond();
+		Autotune_Service();
 
 
 
