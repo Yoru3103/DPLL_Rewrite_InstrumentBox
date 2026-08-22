@@ -269,68 +269,93 @@ void PC_HOST_CMD_Get(void)
 
 /* Stage 1 adaptive-loop framework.  Candidate tables are introduced in Stage 2. */
 #define AUTOTUNE_PROTOCOL_VERSION       1U
-#define AUTOTUNE_SERVICE_PERIOD_MS      50U
-#define AUTOTUNE_BASELINE_TIME_MS       500U
-#define AUTOTUNE_VERIFY_TIME_MS         500U
-#define AUTOTUNE_PROFILE_BASELINE       0U
-#define AUTOTUNE_PROFILE_NONE           0xFFU
+#define AUTOTUNE_SERVICE_PERIOD_MS      50U						// executing period of Autotune_Task();sample frequency = 1000 / 50 = 20Hz
+#define AUTOTUNE_BASELINE_TIME_MS       500U					// 当前参数进行基线统计的时间窗口
+#define AUTOTUNE_VERIFY_TIME_MS         500U					// 最终应用所选参数后，再进行验证一次的时间窗口
+#define AUTOTUNE_PROFILE_BASELINE       0U						// stage1中先只采集原始参数进行尝试比对
+#define AUTOTUNE_PROFILE_NONE           0xFFU					// 表示当前没有有效的profile
 
 typedef enum {
 	AUTOTUNE_TARGET_FREQ = 0,
 	AUTOTUNE_TARGET_DPLL = 1
 } AutotuneTarget;
 
+
+// Control Command from PC
 typedef enum {
-	AUTOTUNE_ACTION_QUERY = 0,
-	AUTOTUNE_ACTION_START = 1,
-	AUTOTUNE_ACTION_CANCEL = 2,
-	AUTOTUNE_ACTION_CLEAR = 3,
-	AUTOTUNE_ACTION_SET_POLICY = 4
+	AUTOTUNE_ACTION_QUERY = 0,					// 查询状态
+	AUTOTUNE_ACTION_START = 1,					// 启动autotune
+	AUTOTUNE_ACTION_CANCEL = 2,					// 取消正在运行的autotune
+	AUTOTUNE_ACTION_CLEAR = 3,					// 清除状态
+	AUTOTUNE_ACTION_SET_POLICY = 4				// 设置autotune策略
 } AutotuneAction;
 
 typedef enum {
-	AUTOTUNE_POLICY_HOST_ONLY = 0,
-	AUTOTUNE_POLICY_BOOT_ONCE = 1,
-	AUTOTUNE_POLICY_BOOT_AND_RECOVER = 2
+	AUTOTUNE_POLICY_HOST_ONLY = 0,				// 只允许PC主动发送START启动
+	AUTOTUNE_POLICY_BOOT_ONCE = 1,				// 上电自动调参一次
+	AUTOTUNE_POLICY_BOOT_AND_RECOVER = 2		// 上述均开启
 } AutotunePolicy;
 
+/*
+ * 自动调参执行状态机。
+ *
+ * IDLE
+ *   ↓
+ * PRECHECK
+ *   ↓
+ * BASELINE
+ *   ↓
+ * SELECT_BEST
+ *   ↓
+ * APPLY_BEST
+ *   ↓
+ * VERIFY
+ *   ↓
+ * DONE
+ *
+ * 出错/取消：
+ *   ↓
+ * ROLLBACK
+ *   ↓
+ * FAILED / CANCELED
+ */
 typedef enum {
 	AUTOTUNE_EXEC_IDLE = 0,
-	AUTOTUNE_EXEC_PRECHECK = 1,
-	AUTOTUNE_EXEC_BASELINE = 2,
-	AUTOTUNE_EXEC_APPLY_CANDIDATE = 3,
-	AUTOTUNE_EXEC_SETTLE = 4,
-	AUTOTUNE_EXEC_EVALUATE = 5,
-	AUTOTUNE_EXEC_NEXT_CANDIDATE = 6,
-	AUTOTUNE_EXEC_SELECT_BEST = 7,
-	AUTOTUNE_EXEC_APPLY_BEST = 8,
-	AUTOTUNE_EXEC_VERIFY = 9,
-	AUTOTUNE_EXEC_ROLLBACK = 10,
-	AUTOTUNE_EXEC_DONE = 11,
-	AUTOTUNE_EXEC_FAILED = 12,
-	AUTOTUNE_EXEC_CANCELED = 13
+	AUTOTUNE_EXEC_PRECHECK = 1,				// 启动前检查：保存参数、检查当前锁定状态。
+	AUTOTUNE_EXEC_BASELINE = 2,				// 测量当前参数的基线性能。
+	AUTOTUNE_EXEC_APPLY_CANDIDATE = 3,		// Stage 2：写入一组候选PID参数。
+	AUTOTUNE_EXEC_SETTLE = 4,				// Stage 2：参数切换后等待PLL稳定。
+	AUTOTUNE_EXEC_EVALUATE = 5,				// Stage 2：采样并评价当前候选参数。
+	AUTOTUNE_EXEC_NEXT_CANDIDATE = 6,		// Stage 2：切换到下一组候选参数。
+	AUTOTUNE_EXEC_SELECT_BEST = 7,			// 所有候选测试完成，选择评分最佳参数。
+	AUTOTUNE_EXEC_APPLY_BEST = 8,			// 将最佳参数正式写入PL。
+	AUTOTUNE_EXEC_VERIFY = 9,				// 应用最佳参数后再次验证锁定性能。
+	AUTOTUNE_EXEC_ROLLBACK = 10,			// 调参失败/取消时恢复调参开始前的参数。
+	AUTOTUNE_EXEC_DONE = 11,				// 自动调参成功完成。
+	AUTOTUNE_EXEC_FAILED = 12,				// 自动调参失败。
+	AUTOTUNE_EXEC_CANCELED = 13				// 用户主动取消。
 } AutotuneExecState;
 
 typedef enum {
-	AUTOTUNE_HEALTH_UNINITIALIZED = 0,
-	AUTOTUNE_HEALTH_VALID = 1,
-	AUTOTUNE_HEALTH_DEGRADED = 2,
-	AUTOTUNE_HEALTH_LOST = 3,
-	AUTOTUNE_HEALTH_RETUNE_PENDING = 4,
-	AUTOTUNE_HEALTH_FAULT = 5
+	AUTOTUNE_HEALTH_UNINITIALIZED = 0,		// 尚未完成任何有效的参数验证。
+	AUTOTUNE_HEALTH_VALID = 1,				// 当前参数有效且保持锁定。
+	AUTOTUNE_HEALTH_DEGRADED = 2,			// Stage 2：性能下降但还没有完全失锁。
+	AUTOTUNE_HEALTH_LOST = 3,				// 已经检测到失锁。
+	AUTOTUNE_HEALTH_RETUNE_PENDING = 4,		// Stage 2：已经判断需要重新调参。
+	AUTOTUNE_HEALTH_FAULT = 5				// 参数写入/回读等硬件异常。
 } AutotuneHealthState;
 
 typedef enum {
-	AUTOTUNE_RESULT_NONE = 0,
-	AUTOTUNE_RESULT_SUCCESS = 1,
-	AUTOTUNE_RESULT_ACCEPTED = 2,
-	AUTOTUNE_RESULT_BUSY = 3,
-	AUTOTUNE_RESULT_REJECTED = 4,
-	AUTOTUNE_RESULT_INVALID_ACTION = 5,
-	AUTOTUNE_RESULT_INVALID_POLICY = 6,
-	AUTOTUNE_RESULT_NOT_LOCKED = 7,
-	AUTOTUNE_RESULT_READBACK_ERROR = 8,
-	AUTOTUNE_RESULT_CANCELED = 9
+	AUTOTUNE_RESULT_NONE = 0,				// 还无结果
+	AUTOTUNE_RESULT_SUCCESS = 1,			// 成功
+	AUTOTUNE_RESULT_ACCEPTED = 2,			// 命令已接收，任务还在运行
+	AUTOTUNE_RESULT_BUSY = 3,				// 当前已有任务运行，无法启动新的任务
+	AUTOTUNE_RESULT_REJECTED = 4,			// 当前状态下拒绝该操作。
+	AUTOTUNE_RESULT_INVALID_ACTION = 5,		// PC发送了不存在的action。
+	AUTOTUNE_RESULT_INVALID_POLICY = 6,		// PC发送了不存在的policy。
+	AUTOTUNE_RESULT_NOT_LOCKED = 7,			// 启动前或验证阶段发现PLL没有有效锁定。
+	AUTOTUNE_RESULT_READBACK_ERROR = 8,		// 写入PL参数后回读不一致。
+	AUTOTUNE_RESULT_CANCELED = 9			// 用户主动取消
 } AutotuneResult;
 
 typedef struct {
@@ -338,51 +363,63 @@ typedef struct {
 	u32 ki;
 	u32 kii;
 	u32 kd;
-	u32 dCoeff;
+	u32 dCoeff;			// D项相关滤波系数
 } AutotuneProfile;
 
 typedef struct {
-	u64 amplitudeSum;
-	u64 absFreqSum;
-	u64 absPhaseSum;
-	u32 amplitudeMin;
-	u32 amplitudeMax;
-	u32 sampleCount;
-	u32 lockedCount;
+	u64 amplitudeSum;						// 幅值累计值
+	u64 absFreqSum;							// |瞬时频率误差|累计值
+	u64 absPhaseSum;						// |相位残差|累计值
+	u32 amplitudeMin;						// 窗口中的最小幅值
+	u32 amplitudeMax;						// 窗口中的最大幅值
+	u32 sampleCount;						// 总采样次数
+	u32 lockedCount;						// 采样时判定为锁定的次数
 } AutotuneMetrics;
 
 typedef struct {
 	AutotuneTarget target;
 	AutotunePolicy policy;
+
+
 	AutotuneExecState execState;
 	AutotuneHealthState healthState;
 	AutotuneResult result;
-	AutotuneProfile originalProfile;
-	AutotuneMetrics metrics;
-	u32 originalManualOffset;
-	u32 runStartMs;
-	u32 stateStartMs;
-	u32 lastServiceMs;
-	u16 currentScore;
-	u16 bestScore;
-	u8 runId;
-	u8 progress;
-	u8 currentProfileId;
-	u8 activeProfileId;
-	u8 bestProfileId;
-	u8 done;
-	u8 busy;
-	u8 failed;
-	u8 paramsValid;
-	u8 lockValid;
-	u8 retunePending;
-	u8 cancelRequested;
-	u8 originalProfileValid;
+
+
+	AutotuneProfile originalProfile;		// 原始PID参数
+	AutotuneMetrics metrics;				// 当前窗口数据
+	u32 originalManualOffset;				// 参数写入过程中保存manual offset。
+
+
+	u32 runStartMs;							// 任务开始时间
+	u32 stateStartMs;						// 状态开始时间
+	u32 lastServiceMs;						// 上次任务执行时间
+
+
+	u16 currentScore;						// 当前profile评分
+	u16 bestScore;							// 最佳评分
+
+
+	u8 runId;								// 任务ID
+	u8 progress;							// 任务进度
+	u8 currentProfileId;					// 当前测试profile编号
+	u8 activeProfileId;						// 当前写入硬件并生效的profile编号
+	u8 bestProfileId;						// 当前最佳profile编号
+
+
+	u8 done;								// 任务完成状态
+	u8 busy;								// 执行任务状态
+	u8 failed;								// 任务失败状态
+	u8 paramsValid;							// 当前PID参数已验证
+	u8 lockValid;							// 当前锁定状态有效
+	u8 retunePending;						// 检测到需要重新调参
+	u8 cancelRequested;						// PC取消请求
+	u8 originalProfileValid;				// 原始profile保存了有效参数
 } AutotuneContext;
 
 static AutotuneContext FreqAutotune;
 static AutotuneContext DpllAutotune;
-static AutotuneContext *AutotuneOwner = NULL;
+static AutotuneContext *AutotuneOwner = NULL;		// 确保同时只运行一个调参
 
 static u32 Autotune_Millis(void)
 {
@@ -391,17 +428,20 @@ static u32 Autotune_Millis(void)
 	return (u32)(now / (COUNTS_PER_SECOND / 1000U));
 }
 
+// 无符号减法，即使计时器发生一次溢出，在时间间隔远小于2^32ms时仍然可以正常工作
 static u32 Autotune_Elapsed(u32 now, u32 start)
 {
 	return now - start;
 }
 
+// 处理INT32_MIN问题
 static u32 Autotune_Abs32(s32 value)
 {
 	if(value >= 0) return (u32)value;
 	return (u32)(-(value + 1)) + 1U;
 }
 
+// 将14bit扩展为32bit有符号数
 static s32 Autotune_SignExtend14(u32 value)
 {
 	value &= 0x3FFFU;
@@ -409,6 +449,7 @@ static s32 Autotune_SignExtend14(u32 value)
 	return (s32)value;
 }
 
+// 根据FREQ与PLL自动返回对应的Lock控制器、手动频率offset、当前环路状态寄存器
 static u32 Autotune_LockAddr(const AutotuneContext *ctx)
 {
 	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_Lock_Ctrl_Addr : PLL0_Lock_Ctrl_Addr;
@@ -424,6 +465,7 @@ static u32 Autotune_StatusRegister(const AutotuneContext *ctx)
 	return Xil_In32((ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_System_Statue_Addr : System_Statue);
 }
 
+// 读取当前PID参数
 static void Autotune_ReadProfile(const AutotuneContext *ctx, AutotuneProfile *profile)
 {
 	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
@@ -475,6 +517,7 @@ static int Autotune_ApplyProfile(AutotuneContext *ctx, const AutotuneProfile *pr
 	return Autotune_ProfileEqual(&active, profile);
 }
 
+// 每次开启新的评价窗口前清空统计数据
 static void Autotune_ResetMetrics(AutotuneMetrics *metrics)
 {
 	metrics->amplitudeSum = 0U;
@@ -521,12 +564,14 @@ static u16 Autotune_Score(const AutotuneMetrics *metrics)
 	return (score > 0xFFFFU) ? 0xFFFFU : (u16)score;
 }
 
+// 切换状态机状态
 static void Autotune_SetState(AutotuneContext *ctx, AutotuneExecState state, u32 now)
 {
 	ctx->execState = state;
 	ctx->stateStartMs = now;
 }
 
+// 释放状态机
 static void Autotune_ReleaseOwner(AutotuneContext *ctx)
 {
 	if(AutotuneOwner == ctx) AutotuneOwner = NULL;
@@ -544,6 +589,21 @@ static void Autotune_Fail(AutotuneContext *ctx, AutotuneResult result, u32 now)
 	Autotune_ReleaseOwner(ctx);
 }
 
+/*
+ * bit 0      done
+ * bit 1      busy
+ * bit 2      failed
+ * bit 3      paramsValid
+ * bit 4      lockValid
+ * bit 5      retunePending
+ * bit 6      recover policy enabled
+ * bit 7      automatic policy enabled
+ *
+ * bit 8~11   execState
+ * bit 12~15  healthState
+ * bit 16~23  result
+ * bit 24~31  runId
+ */
 static u32 Autotune_StatusWord(const AutotuneContext *ctx, AutotuneResult responseResult)
 {
 	u32 status = 0U;
@@ -568,6 +628,24 @@ static u8 Autotune_Ready(const AutotuneContext *ctx)
 	return ctx->done && ctx->paramsValid && ctx->lockValid;
 }
 
+/*
+ * Payload:
+ *
+ * [4]      protocol version
+ * [5]      action
+ *
+ * [6:9]    status word, little-endian
+ *
+ * [10]     progress
+ * [11]     current profile id
+ * [12]     active profile id
+ * [13]     best profile id
+ *
+ * [14:15]  current score
+ * [16:17]  best score
+ *
+ * [18:21]  elapsed time(ms)
+ */
 static void Autotune_SendResponse(AutotuneContext *ctx, u8 action, AutotuneResult responseResult)
 {
 	u32 status = Autotune_StatusWord(ctx, responseResult);
@@ -601,12 +679,12 @@ static void Autotune_Start(AutotuneContext *ctx, u32 now)
 	ctx->busy = 1U;
 	ctx->retunePending = 0U;
 	ctx->cancelRequested = 0U;
-	ctx->originalProfileValid = 0U;
-	ctx->result = AUTOTUNE_RESULT_ACCEPTED;
-	ctx->progress = 1U;
+	ctx->originalProfileValid = 0U;							// PRECHECK尚未保存originalProfile
+	ctx->result = AUTOTUNE_RESULT_ACCEPTED;					// START只是被接受，还没有成功完成
+	ctx->progress = 1U;	
 	ctx->currentProfileId = AUTOTUNE_PROFILE_BASELINE;
 	ctx->bestProfileId = AUTOTUNE_PROFILE_NONE;
-	ctx->currentScore = 0xFFFFU;
+	ctx->currentScore = 0xFFFFU;							// 0xFFFF表示尚未获得有效score
 	ctx->bestScore = 0xFFFFU;
 	ctx->runStartMs = now;
 	Autotune_ResetMetrics(&ctx->metrics);
@@ -663,7 +741,7 @@ static void Autotune_Command(AutotuneContext *ctx)
 
 static void Autotune_Task(AutotuneContext *ctx, u32 now)
 {
-	if(Autotune_Elapsed(now, ctx->lastServiceMs) < AUTOTUNE_SERVICE_PERIOD_MS) return;
+	if(Autotune_Elapsed(now, ctx->lastServiceMs) < AUTOTUNE_SERVICE_PERIOD_MS) return;		// 50ms调用一次
 	ctx->lastServiceMs = now;
 
 	if(ctx->paramsValid && !ctx->busy) {
@@ -671,6 +749,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 		ctx->healthState = ctx->lockValid ? AUTOTUNE_HEALTH_VALID : AUTOTUNE_HEALTH_LOST;
 		if(!ctx->lockValid && ctx->policy == AUTOTUNE_POLICY_BOOT_AND_RECOVER) ctx->retunePending = 1U;
 	}
+	// 没任务直接返回
 	if(!ctx->busy) return;
 	if(ctx->cancelRequested && ctx->execState != AUTOTUNE_EXEC_ROLLBACK) {
 		Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
