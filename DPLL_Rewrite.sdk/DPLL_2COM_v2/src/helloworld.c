@@ -267,13 +267,18 @@ void PC_HOST_CMD_Get(void)
 	PC_HOST_CMD_ASK = 0x00;
 }
 
-/* Stage 1 adaptive-loop framework.  Candidate tables are introduced in Stage 2. */
+/* Scheme B adaptive-loop framework. */
 #define AUTOTUNE_PROTOCOL_VERSION       1U
-#define AUTOTUNE_SERVICE_PERIOD_MS      50U						// executing period of Autotune_Task();sample frequency = 1000 / 50 = 20Hz
-#define AUTOTUNE_BASELINE_TIME_MS       500U					// 当前参数进行基线统计的时间窗口
-#define AUTOTUNE_VERIFY_TIME_MS         500U					// 最终应用所选参数后，再进行验证一次的时间窗口
-#define AUTOTUNE_PROFILE_BASELINE       0U						// stage1中先只采集原始参数进行尝试比对
+#define AUTOTUNE_IDLE_PERIOD_MS         50U
+#define AUTOTUNE_SAMPLE_PERIOD_MS       1U
+#define AUTOTUNE_EVALUATE_TIME_MS       1000U
+#define AUTOTUNE_VERIFY_TIME_MS         1000U
+#define AUTOTUNE_MIN_SAMPLES            800U
+#define AUTOTUNE_MIN_LOCK_PERCENT       90U
+#define AUTOTUNE_MAX_RESIDUAL_PERCENT   5U
+#define AUTOTUNE_PROFILE_ORIGINAL       0U
 #define AUTOTUNE_PROFILE_NONE           0xFFU					// 表示当前没有有效的profile
+#define AUTOTUNE_CANDIDATE_COUNT        4U
 
 typedef enum {
 	AUTOTUNE_TARGET_FREQ = 0,
@@ -372,8 +377,14 @@ typedef struct {
 	u64 absPhaseSum;						// |相位残差|累计值
 	u32 amplitudeMin;						// 窗口中的最小幅值
 	u32 amplitudeMax;						// 窗口中的最大幅值
+	u32 absFreqMax;							// 窗口内最大的瞬时频率误差
+	u32 absPhaseMax;						// 窗口内最大的相位残差
+	s32 outputMin;							// 窗口内PID/PLL输出最小值
+	s32 outputMax;							// 窗口内PID/PLL输出最大值
 	u32 sampleCount;						// 总采样次数
 	u32 lockedCount;						// 采样时判定为锁定的次数
+	u32 railCount;							// 状态寄存器指示输出触顶/触底的采样次数
+	u32 residualBadCount;					// 状态寄存器指示 residual 异常的采样次数
 } AutotuneMetrics;
 
 typedef struct {
@@ -387,8 +398,10 @@ typedef struct {
 
 
 	AutotuneProfile originalProfile;		// 原始PID参数
+	AutotuneProfile bestProfile;
 	AutotuneMetrics metrics;				// 当前窗口数据
 	u32 originalManualOffset;				// 参数写入过程中保存manual offset。
+	u32 baselineAmplitudeMean;				// 原始 PID 下的平均幅值基准
 
 
 	u32 runStartMs;							// 任务开始时间
@@ -396,8 +409,8 @@ typedef struct {
 	u32 lastServiceMs;						// 上次任务执行时间
 
 
-	u16 currentScore;						// 当前profile评分
-	u16 bestScore;							// 最佳评分
+	u32 currentScore;						// 当前profile评分
+	u32 bestScore;							// 最佳评分
 
 
 	u8 runId;								// 任务ID
@@ -405,6 +418,7 @@ typedef struct {
 	u8 currentProfileId;					// 当前测试profile编号
 	u8 activeProfileId;						// 当前写入硬件并生效的profile编号
 	u8 bestProfileId;						// 当前最佳profile编号
+	u8 candidateIndex;
 
 
 	u8 done;								// 任务完成状态
@@ -420,6 +434,21 @@ typedef struct {
 static AutotuneContext FreqAutotune;
 static AutotuneContext DpllAutotune;
 static AutotuneContext *AutotuneOwner = NULL;		// 确保同时只运行一个调参
+
+// Stage 2 Tests
+static const AutotuneProfile FreqCandidateProfiles[AUTOTUNE_CANDIDATE_COUNT] = {
+	{0x00200000U, 0x00040000U, 0U, 0U, 0x0000FFFFU},
+	{0x00200000U, 0x00080000U, 0U, 0U, 0x0000FFFFU},
+	{0x00300000U, 0x000C0000U, 0U, 0U, 0x0000FFFFU},
+	{0x00400000U, 0x00100000U, 0U, 0U, 0x0000FFFFU}
+};
+
+static const AutotuneProfile DpllCandidateProfiles[AUTOTUNE_CANDIDATE_COUNT] = {
+	{550000U, 250000U, 0U, 0U, 0x0000FFFFU},
+	{550000U, 500000U, 0U, 0U, 0x0000FFFFU},
+	{825000U, 750000U, 0U, 0U, 0x0000FFFFU},
+	{1100000U, 1000000U, 0U, 0U, 0x0000FFFFU}
+};
 
 static u32 Autotune_Millis(void)
 {
@@ -463,6 +492,17 @@ static u32 Autotune_ManualOffsetAddr(const AutotuneContext *ctx)
 static u32 Autotune_StatusRegister(const AutotuneContext *ctx)
 {
 	return Xil_In32((ctx->target == AUTOTUNE_TARGET_FREQ) ? Freq_Meter_System_Statue_Addr : System_Statue);
+}
+
+static u32 Autotune_SettleTimeMs(const AutotuneContext *ctx)
+{
+	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? 300U : 800U;
+}
+
+static const AutotuneProfile *Autotune_Candidate(const AutotuneContext *ctx)
+{
+	return (ctx->target == AUTOTUNE_TARGET_FREQ) ?
+		&FreqCandidateProfiles[ctx->candidateIndex] : &DpllCandidateProfiles[ctx->candidateIndex];
 }
 
 // 读取当前PID参数
@@ -514,7 +554,7 @@ static int Autotune_ApplyProfile(AutotuneContext *ctx, const AutotuneProfile *pr
 	Autotune_ReadProfile(ctx, &active);
 	Xil_Out32(Autotune_ManualOffsetAddr(ctx), ctx->originalManualOffset);
 	Xil_Out32(Autotune_LockAddr(ctx), 1U);
-	return Autotune_ProfileEqual(&active, profile);
+	return Autotune_ProfileEqual(&active, profile) && ((Xil_In32(Autotune_LockAddr(ctx)) & 1U) != 0U);
 }
 
 // 每次开启新的评价窗口前清空统计数据
@@ -525,8 +565,14 @@ static void Autotune_ResetMetrics(AutotuneMetrics *metrics)
 	metrics->absPhaseSum = 0U;
 	metrics->amplitudeMin = 0xFFFFFFFFU;
 	metrics->amplitudeMax = 0U;
+	metrics->absFreqMax = 0U;
+	metrics->absPhaseMax = 0U;
+	metrics->outputMin = 0x7FFFFFFF;
+	metrics->outputMax = (s32)0x80000000U;
 	metrics->sampleCount = 0U;
 	metrics->lockedCount = 0U;
+	metrics->railCount = 0U;
+	metrics->residualBadCount = 0U;
 }
 
 static void Autotune_Sample(AutotuneContext *ctx)
@@ -535,32 +581,71 @@ static void Autotune_Sample(AutotuneContext *ctx)
 	u32 frequency;
 	u32 phase;
 	u32 status;
+	u32 absFrequency;
+	u32 absPhase;
+	s32 output;
 	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
 		amplitude = Xil_In32(Freq_Meter_Amplitude_Addr) & 0xFFFFU;
 		frequency = Xil_In32(Freq_Meter_inst_frequency_Addr);
 		phase = Xil_In32(Freq_Meter_PLL_phase_residuals_Addr);
+		output = (s32)Xil_In32(Freq_Meter_PLL_Output_Limit_Addr);
 	} else {
 		amplitude = Xil_In32(DDC0_Amplitude) & 0xFFFFU;
 		frequency = Xil_In32(DDC0_inst_frequency);
 		phase = Xil_In32(PLL0_phase_residuals);
+		output = (s32)Xil_In32(PLL0_Output_Limit);
 	}
 	status = Autotune_StatusRegister(ctx);
+	absFrequency = Autotune_Abs32(Autotune_SignExtend14(frequency));
+	absPhase = Autotune_Abs32((s32)phase);
 	ctx->metrics.amplitudeSum += amplitude;
-	ctx->metrics.absFreqSum += Autotune_Abs32(Autotune_SignExtend14(frequency));
-	ctx->metrics.absPhaseSum += Autotune_Abs32((s32)phase);
+	ctx->metrics.absFreqSum += absFrequency;
+	ctx->metrics.absPhaseSum += absPhase;
 	if(amplitude < ctx->metrics.amplitudeMin) ctx->metrics.amplitudeMin = amplitude;
 	if(amplitude > ctx->metrics.amplitudeMax) ctx->metrics.amplitudeMax = amplitude;
+	if(absFrequency > ctx->metrics.absFreqMax) ctx->metrics.absFreqMax = absFrequency;
+	if(absPhase > ctx->metrics.absPhaseMax) ctx->metrics.absPhaseMax = absPhase;
+	if(output < ctx->metrics.outputMin) ctx->metrics.outputMin = output;
+	if(output > ctx->metrics.outputMax) ctx->metrics.outputMax = output;
 	ctx->metrics.sampleCount++;
 	if((status & 0x3FU) == 0x30U) ctx->metrics.lockedCount++;
+	if((status & 0x0CU) != 0U) ctx->metrics.railCount++;
+	if((status & 0x03U) != 0U) ctx->metrics.residualBadCount++;
 }
 
-static u16 Autotune_Score(const AutotuneMetrics *metrics)
+static u32 Autotune_Score(const AutotuneMetrics *metrics)
 {
 	u64 score;
-	if(metrics->sampleCount == 0U) return 0xFFFFU;
+	u32 unlockedCount;
+	if(metrics->sampleCount == 0U) return 0xFFFFFFFFU;
+	unlockedCount = metrics->sampleCount - metrics->lockedCount;
 	score = metrics->absFreqSum / metrics->sampleCount;
 	score += (metrics->absPhaseSum / metrics->sampleCount) >> 10;
-	score += ((u64)(metrics->sampleCount - metrics->lockedCount) * 1000U) / metrics->sampleCount;
+	score += 1000U * (((u64)unlockedCount * 1000U) / metrics->sampleCount);
+	score += 4000U * (((u64)metrics->railCount * 1000U) / metrics->sampleCount);
+	score += 2000U * (((u64)metrics->residualBadCount * 1000U) / metrics->sampleCount);
+	return (score > 0xFFFFFFFFU) ? 0xFFFFFFFFU : (u32)score;
+}
+
+// 统计窗口有效性
+// 1数据合格 0数据不可信，淘汰
+static int Autotune_MetricsQualified(const AutotuneContext *ctx, int baseline)
+{
+	u32 amplitudeMean;
+	const AutotuneMetrics *metrics = &ctx->metrics;
+	if(metrics->sampleCount < AUTOTUNE_MIN_SAMPLES) return 0;
+	if(metrics->lockedCount * 100U < metrics->sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) return 0;
+	if(metrics->railCount != 0U) return 0;
+	if(metrics->residualBadCount * 100U > metrics->sampleCount * AUTOTUNE_MAX_RESIDUAL_PERCENT) return 0;
+	if(!baseline && ctx->baselineAmplitudeMean != 0U) {
+		amplitudeMean = (u32)(metrics->amplitudeSum / metrics->sampleCount);
+		if(amplitudeMean * 2U < ctx->baselineAmplitudeMean) return 0;
+	}
+	return 1;
+}
+
+static u16 Autotune_LegacyScore(u32 score)
+{
 	return (score > 0xFFFFU) ? 0xFFFFU : (u16)score;
 }
 
@@ -650,6 +735,8 @@ static void Autotune_SendResponse(AutotuneContext *ctx, u8 action, AutotuneResul
 {
 	u32 status = Autotune_StatusWord(ctx, responseResult);
 	u32 elapsed = ctx->runStartMs ? Autotune_Elapsed(Autotune_Millis(), ctx->runStartMs) : 0U;
+	u16 currentScore = Autotune_LegacyScore(ctx->currentScore);
+	u16 bestScore = Autotune_LegacyScore(ctx->bestScore);
 	Uart0_TX_Buff[4] = AUTOTUNE_PROTOCOL_VERSION;
 	Uart0_TX_Buff[5] = action;
 	Uart0_TX_Buff[6] = status & 0xFFU;
@@ -660,10 +747,10 @@ static void Autotune_SendResponse(AutotuneContext *ctx, u8 action, AutotuneResul
 	Uart0_TX_Buff[11] = ctx->currentProfileId;
 	Uart0_TX_Buff[12] = ctx->activeProfileId;
 	Uart0_TX_Buff[13] = ctx->bestProfileId;
-	Uart0_TX_Buff[14] = ctx->currentScore & 0xFFU;
-	Uart0_TX_Buff[15] = (ctx->currentScore >> 8) & 0xFFU;
-	Uart0_TX_Buff[16] = ctx->bestScore & 0xFFU;
-	Uart0_TX_Buff[17] = (ctx->bestScore >> 8) & 0xFFU;
+	Uart0_TX_Buff[14] = currentScore & 0xFFU;
+	Uart0_TX_Buff[15] = (currentScore >> 8) & 0xFFU;
+	Uart0_TX_Buff[16] = bestScore & 0xFFU;
+	Uart0_TX_Buff[17] = (bestScore >> 8) & 0xFFU;
 	Uart0_TX_Buff[18] = elapsed & 0xFFU;
 	Uart0_TX_Buff[19] = (elapsed >> 8) & 0xFFU;
 	Uart0_TX_Buff[20] = (elapsed >> 16) & 0xFFU;
@@ -682,10 +769,12 @@ static void Autotune_Start(AutotuneContext *ctx, u32 now)
 	ctx->originalProfileValid = 0U;							// PRECHECK尚未保存originalProfile
 	ctx->result = AUTOTUNE_RESULT_ACCEPTED;					// START只是被接受，还没有成功完成
 	ctx->progress = 1U;	
-	ctx->currentProfileId = AUTOTUNE_PROFILE_BASELINE;
+	ctx->currentProfileId = AUTOTUNE_PROFILE_ORIGINAL;
 	ctx->bestProfileId = AUTOTUNE_PROFILE_NONE;
-	ctx->currentScore = 0xFFFFU;							// 0xFFFF表示尚未获得有效score
-	ctx->bestScore = 0xFFFFU;
+	ctx->candidateIndex = 0U;
+	ctx->currentScore = 0xFFFFFFFFU;
+	ctx->bestScore = 0xFFFFFFFFU;
+	ctx->baselineAmplitudeMean = 0U;
 	ctx->runStartMs = now;
 	Autotune_ResetMetrics(&ctx->metrics);
 	AutotuneOwner = ctx;
@@ -741,7 +830,11 @@ static void Autotune_Command(AutotuneContext *ctx)
 
 static void Autotune_Task(AutotuneContext *ctx, u32 now)
 {
-	if(Autotune_Elapsed(now, ctx->lastServiceMs) < AUTOTUNE_SERVICE_PERIOD_MS) return;		// 50ms调用一次
+	u32 elapsed;
+	u32 settleTime;
+	u8 progressBase;
+	const AutotuneProfile *candidate;
+	if(Autotune_Elapsed(now, ctx->lastServiceMs) < (ctx->busy ? AUTOTUNE_SAMPLE_PERIOD_MS : AUTOTUNE_IDLE_PERIOD_MS)) return;
 	ctx->lastServiceMs = now;
 
 	if(ctx->paramsValid && !ctx->busy) {
@@ -758,49 +851,108 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 	switch(ctx->execState) {
 	case AUTOTUNE_EXEC_PRECHECK:
 		Autotune_ReadProfile(ctx, &ctx->originalProfile);
+		ctx->bestProfile = ctx->originalProfile;
+		ctx->activeProfileId = AUTOTUNE_PROFILE_ORIGINAL;
 		ctx->originalManualOffset = Xil_In32(Autotune_ManualOffsetAddr(ctx));
 		ctx->originalProfileValid = 1U;
 		if((Autotune_StatusRegister(ctx) & 0x20U) == 0U) {
 			Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
 			break;
 		}
-		ctx->progress = 10U;
+		ctx->progress = 5U;
 		Autotune_ResetMetrics(&ctx->metrics);
 		Autotune_SetState(ctx, AUTOTUNE_EXEC_BASELINE, now);
 		break;
 	case AUTOTUNE_EXEC_BASELINE:
 		Autotune_Sample(ctx);
-		ctx->progress = 10U + (u8)((Autotune_Elapsed(now, ctx->stateStartMs) * 35U) / AUTOTUNE_BASELINE_TIME_MS);
-		if(Autotune_Elapsed(now, ctx->stateStartMs) >= AUTOTUNE_BASELINE_TIME_MS) {
+		elapsed = Autotune_Elapsed(now, ctx->stateStartMs);
+		ctx->progress = 5U + (u8)((elapsed * 15U) / AUTOTUNE_EVALUATE_TIME_MS);
+		if(elapsed >= AUTOTUNE_EVALUATE_TIME_MS) {
 			ctx->currentScore = Autotune_Score(&ctx->metrics);
-			if(ctx->metrics.sampleCount < 3U || ctx->metrics.lockedCount * 2U < ctx->metrics.sampleCount) {
+			if(!Autotune_MetricsQualified(ctx, 1)) {
 				Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
 			} else {
+				ctx->baselineAmplitudeMean = (u32)(ctx->metrics.amplitudeSum / ctx->metrics.sampleCount);
 				ctx->bestScore = ctx->currentScore;
-				ctx->bestProfileId = AUTOTUNE_PROFILE_BASELINE;
-				Autotune_SetState(ctx, AUTOTUNE_EXEC_SELECT_BEST, now);
+				ctx->bestProfile = ctx->originalProfile;
+				ctx->bestProfileId = AUTOTUNE_PROFILE_ORIGINAL;
+				ctx->candidateIndex = 0U;
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_APPLY_CANDIDATE, now);
 			}
 		}
 		break;
+	case AUTOTUNE_EXEC_APPLY_CANDIDATE:
+		candidate = Autotune_Candidate(ctx);
+		ctx->currentProfileId = ctx->candidateIndex + 1U;
+		if(!Autotune_ApplyProfile(ctx, candidate)) {
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+		} else {
+			ctx->activeProfileId = ctx->currentProfileId;
+			ctx->progress = 20U + ctx->candidateIndex * 15U;
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_SETTLE, now);
+		}
+		break;
+	case AUTOTUNE_EXEC_SETTLE:
+		settleTime = Autotune_SettleTimeMs(ctx);
+		elapsed = Autotune_Elapsed(now, ctx->stateStartMs);
+		if(elapsed >= settleTime) {
+			if((Autotune_StatusRegister(ctx) & 0x3FU) != 0x30U) {
+				if(ctx->candidateIndex == 0U) Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+				else Autotune_SetState(ctx, AUTOTUNE_EXEC_NEXT_CANDIDATE, now);
+			} else {
+				Autotune_ResetMetrics(&ctx->metrics);
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_EVALUATE, now);
+			}
+		}
+		break;
+	case AUTOTUNE_EXEC_EVALUATE:
+		Autotune_Sample(ctx);
+		elapsed = Autotune_Elapsed(now, ctx->stateStartMs);
+		progressBase = 20U + ctx->candidateIndex * 15U;
+		ctx->progress = progressBase + (u8)((elapsed * 14U) / AUTOTUNE_EVALUATE_TIME_MS);
+		if(elapsed >= AUTOTUNE_EVALUATE_TIME_MS) {
+			ctx->currentScore = Autotune_Score(&ctx->metrics);
+			if(Autotune_MetricsQualified(ctx, 0) && ctx->currentScore < ctx->bestScore) {
+				ctx->bestScore = ctx->currentScore;
+				ctx->bestProfile = *Autotune_Candidate(ctx);
+				ctx->bestProfileId = ctx->currentProfileId;
+			}
+			if(ctx->candidateIndex == 0U &&
+				ctx->metrics.lockedCount * 100U < ctx->metrics.sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) {
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
+			} else {
+				Autotune_SetState(ctx, AUTOTUNE_EXEC_NEXT_CANDIDATE, now);
+			}
+		}
+		break;
+	case AUTOTUNE_EXEC_NEXT_CANDIDATE:
+		if((ctx->candidateIndex + 1U) < AUTOTUNE_CANDIDATE_COUNT) {
+			ctx->candidateIndex++;
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_APPLY_CANDIDATE, now);
+		} else {
+			Autotune_SetState(ctx, AUTOTUNE_EXEC_SELECT_BEST, now);
+		}
+		break;
 	case AUTOTUNE_EXEC_SELECT_BEST:
-		ctx->progress = 50U;
+		ctx->progress = 80U;
 		Autotune_SetState(ctx, AUTOTUNE_EXEC_APPLY_BEST, now);
 		break;
 	case AUTOTUNE_EXEC_APPLY_BEST:
-		if(!Autotune_ApplyProfile(ctx, &ctx->originalProfile)) {
+		if(!Autotune_ApplyProfile(ctx, &ctx->bestProfile)) {
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 		} else {
-			ctx->activeProfileId = AUTOTUNE_PROFILE_BASELINE;
-			ctx->progress = 60U;
+			ctx->activeProfileId = ctx->bestProfileId;
+			ctx->progress = 80U;
 			Autotune_ResetMetrics(&ctx->metrics);
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_VERIFY, now);
 		}
 		break;
 	case AUTOTUNE_EXEC_VERIFY:
 		Autotune_Sample(ctx);
-		ctx->progress = 60U + (u8)((Autotune_Elapsed(now, ctx->stateStartMs) * 39U) / AUTOTUNE_VERIFY_TIME_MS);
-		if(Autotune_Elapsed(now, ctx->stateStartMs) >= AUTOTUNE_VERIFY_TIME_MS) {
-			if(ctx->metrics.sampleCount < 3U || ctx->metrics.lockedCount * 2U < ctx->metrics.sampleCount) {
+		elapsed = Autotune_Elapsed(now, ctx->stateStartMs);
+		ctx->progress = 80U + (u8)((elapsed * 19U) / AUTOTUNE_VERIFY_TIME_MS);
+		if(elapsed >= AUTOTUNE_VERIFY_TIME_MS) {
+			if(!Autotune_MetricsQualified(ctx, 0)) {
 				Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 			} else {
 				ctx->done = 1U;
@@ -819,6 +971,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 		if(ctx->originalProfileValid && !Autotune_ApplyProfile(ctx, &ctx->originalProfile)) {
 			Autotune_Fail(ctx, AUTOTUNE_RESULT_READBACK_ERROR, now);
 		} else if(ctx->cancelRequested) {
+			ctx->activeProfileId = AUTOTUNE_PROFILE_ORIGINAL;
 			ctx->done = 0U;
 			ctx->failed = 0U;
 			ctx->result = AUTOTUNE_RESULT_CANCELED;
@@ -826,6 +979,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_CANCELED, now);
 			Autotune_ReleaseOwner(ctx);
 		} else {
+			ctx->activeProfileId = AUTOTUNE_PROFILE_ORIGINAL;
 			Autotune_Fail(ctx, AUTOTUNE_RESULT_NOT_LOCKED, now);
 		}
 		break;
@@ -847,8 +1001,10 @@ static void Autotune_InitContext(AutotuneContext *ctx, AutotuneTarget target)
 	ctx->currentProfileId = AUTOTUNE_PROFILE_NONE;
 	ctx->activeProfileId = AUTOTUNE_PROFILE_NONE;
 	ctx->bestProfileId = AUTOTUNE_PROFILE_NONE;
-	ctx->currentScore = 0xFFFFU;
-	ctx->bestScore = 0xFFFFU;
+	ctx->currentScore = 0xFFFFFFFFU;
+	ctx->bestScore = 0xFFFFFFFFU;
+	ctx->candidateIndex = 0U;
+	ctx->baselineAmplitudeMean = 0U;
 	ctx->done = ctx->busy = ctx->failed = 0U;
 	ctx->paramsValid = ctx->lockValid = ctx->retunePending = ctx->cancelRequested = 0U;
 	ctx->originalProfileValid = 0U;

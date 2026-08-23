@@ -1,0 +1,22 @@
+[
+  {
+    "name": "freq_default_repeatability",
+    "target": "freq",
+    "repeat": 3,
+    "center_frequency": null,
+    "pid": null,
+    "autotune": true,
+    "timeout_s": 20,
+    "note": "固定输入条件下检查最佳 profile 是否可重复"
+  },
+  {
+    "name": "dpll_manual_baseline_then_autotune",
+    "target": "dpll",
+    "repeat": 1,
+    "center_frequency": "0x051EB851",
+    "pid": [1100000, 1000000, 1000000, 80000000],
+    "autotune": true,
+    "timeout_s": 25,
+    "note": "先恢复原始参数，再运行候选扫描"
+  }
+]
