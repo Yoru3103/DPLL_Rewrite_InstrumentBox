@@ -263,6 +263,15 @@ DDC_wideband_filters DDC0_inst (
 wire pll0_lock,pll0_lock_i, pll0_gain_changedp, pll0_gain_changedi, pll0_gain_changedii, pll0_gain_changedd, pll0_coef_changedd;
 wire pll0_gain_changed;
 wire [32-1:0] pll0_gainp, pll0_gaini, pll0_gainii, pll0_gaind, pll0_coefdfilter;
+// 阶段 3 原子参数接口：adaptive_gain* 位于 3.125 MHz 环路侧，是 legacy/active 选择后的最终参数。
+wire [31:0] adaptive_gainp, adaptive_gaini, adaptive_gainii, adaptive_gaind, adaptive_coefdfilter;
+wire adaptive_gain_changed; // 已同步到 clk_dpll 域的参数变化单拍脉冲
+wire [7:0] adaptive_shadow_profile, adaptive_active_profile; // bus 域待提交/活动 profile 镜像
+wire [31:0] adaptive_shadow_kp, adaptive_shadow_ki, adaptive_shadow_kii;
+wire [31:0] adaptive_shadow_kd, adaptive_shadow_dcoef;
+wire [31:0] adaptive_applied_seq, adaptive_apply_status; // ack 确认序号和提交状态字
+wire [31:0] adaptive_active_kp, adaptive_active_ki, adaptive_active_kii;
+wire [31:0] adaptive_active_kd, adaptive_active_dcoef, adaptive_commit_error_count;
 wire [32-1:0] pll0_output;
 
 // Then the registers which controls the gain and locked/unlocked behavior of the filters:
@@ -357,6 +366,26 @@ parallel_bus_register_pll0_coefdfilter (
      
 // This is used for bumpless change of the gain settings (TODO, most probably in the output summing block)
 assign pll0_gain_changed = pll0_gain_changedp | pll0_gain_changedi | pll0_gain_changedii | pll0_gain_changedd | pll0_coef_changedd;
+
+// request/ack toggle 保证 125 MHz 总线域参数在 3.125 MHz 环路域只应用一次且不丢失。
+adaptive_param_commit_cdc adaptive_parameter_commit (
+    .bus_clk(clk1), .loop_clk(clk_dpll), .reset_n(rst),
+    .bus_write(cmd_trig), .bus_address(cmd_addr), .bus_wdata(cmd_datain[31:0]),
+    .legacy_changed(pll0_gain_changed),
+    .legacy_kp(pll0_gainp), .legacy_ki(pll0_gaini), .legacy_kii(pll0_gainii),
+    .legacy_kd(pll0_gaind), .legacy_dcoef(pll0_coefdfilter),
+    .loop_kp(adaptive_gainp), .loop_ki(adaptive_gaini), .loop_kii(adaptive_gainii),
+    .loop_kd(adaptive_gaind), .loop_dcoef(adaptive_coefdfilter),
+    .loop_gain_changed(adaptive_gain_changed),
+    .shadow_profile(adaptive_shadow_profile), .shadow_kp(adaptive_shadow_kp),
+    .shadow_ki(adaptive_shadow_ki), .shadow_kii(adaptive_shadow_kii),
+    .shadow_kd(adaptive_shadow_kd), .shadow_dcoef(adaptive_shadow_dcoef),
+    .applied_seq(adaptive_applied_seq), .apply_status(adaptive_apply_status),
+    .active_profile_bus(adaptive_active_profile), .active_kp_bus(adaptive_active_kp),
+    .active_ki_bus(adaptive_active_ki), .active_kii_bus(adaptive_active_kii),
+    .active_kd_bus(adaptive_active_kd), .active_dcoef_bus(adaptive_active_dcoef),
+    .commit_error_count(adaptive_commit_error_count)
+);
      
 // Finally the PLL itself:
 PLL_loop_filters_with_saturation # (
@@ -369,13 +398,13 @@ PLL_loop_filters_with_saturation # (
 PLL0_loop_filters (
     .clk(clk_dpll), 
     .lock(pll0_lock), 
-    .gain_changed(pll0_gain_changed), 
+    .gain_changed(adaptive_gain_changed),
     .data_in(inst_frequency0), 
-    .gain_p(pll0_gainp), 
-    .gain_i(pll0_gaini), 
-    .gain_ii(pll0_gainii),
-    .gain_d(pll0_gaind),
-    .coef_d_filter(pll0_coefdfilter),
+    .gain_p(adaptive_gainp),
+    .gain_i(adaptive_gaini),
+    .gain_ii(adaptive_gainii),
+    .gain_d(adaptive_gaind),
+    .coef_d_filter(adaptive_coefdfilter),
     .phase_residuals(phase_residuals0),
     .data_out(pll0_output),
     .saturated_low(),
@@ -798,6 +827,80 @@ PLL_output_average#
 wire sys_en;
 assign sys_en = sys_wen | sys_ren;
 
+// 后缀 _loop：3.125 MHz 统计源域中的冻结快照；无后缀：已复制到 125 MHz 总线域的快照。
+wire adaptive_snapshot_toggle_loop; // 每完成一个 DPLL 统计窗口翻转一次
+wire [31:0] adaptive_snapshot_seq_loop, adaptive_snapshot_samples_loop;
+wire [63:0] adaptive_amp_sum_loop, adaptive_freq_abs_sum_loop, adaptive_phase_abs_sum_loop;
+wire [15:0] adaptive_amp_min_loop, adaptive_amp_max_loop;
+wire [31:0] adaptive_freq_abs_max_loop, adaptive_phase_abs_max_loop;
+wire [31:0] adaptive_output_min_loop, adaptive_output_max_loop;
+wire [31:0] adaptive_locked_samples_loop, adaptive_pos_rail_samples_loop;
+wire [31:0] adaptive_neg_rail_samples_loop, adaptive_freq_bad_samples_loop;
+wire [31:0] adaptive_phase_bad_samples_loop, adaptive_loss_lock_events_loop;
+wire [31:0] adaptive_pos_rail_events_loop, adaptive_neg_rail_events_loop;
+
+wire [31:0] adaptive_snapshot_seq, adaptive_snapshot_samples;
+wire [63:0] adaptive_amp_sum, adaptive_freq_abs_sum, adaptive_phase_abs_sum;
+wire [15:0] adaptive_amp_min, adaptive_amp_max;
+wire [31:0] adaptive_freq_abs_max, adaptive_phase_abs_max;
+wire [31:0] adaptive_output_min, adaptive_output_max;
+wire [31:0] adaptive_locked_samples, adaptive_pos_rail_samples, adaptive_neg_rail_samples;
+wire [31:0] adaptive_freq_bad_samples, adaptive_phase_bad_samples;
+wire [31:0] adaptive_loss_lock_events, adaptive_pos_rail_events, adaptive_neg_rail_events;
+// 672 bit bundled-data：源域保持整组数据稳定，目的域检测 toggle 后一次性锁存。
+wire [671:0] adaptive_snapshot_source_bundle, adaptive_snapshot_bus_bundle;
+
+adaptive_statistics #(.WINDOW_LOG2(12)) adaptive_loop_statistics (
+    .clk(clk_dpll), .reset_n(rst), .amplitude(DDC_Amplitude_0),
+    .frequency_error(inst_frequency0), .phase_error(phase_residuals0),
+    .loop_output(PID_OUT_With_Limit), .locked(pll0_lock & pll0_locked_Instant),
+    .rail_positive(dac0_railed_positive), .rail_negative(dac0_railed_negative),
+    .frequency_bad(residuals0_are_above_threshold_freq),
+    .phase_bad(residuals0_are_above_threshold_phase),
+    .snapshot_seq(adaptive_snapshot_seq_loop), .snapshot_toggle(adaptive_snapshot_toggle_loop),
+    .sample_count(adaptive_snapshot_samples_loop), .amplitude_sum(adaptive_amp_sum_loop),
+    .amplitude_min(adaptive_amp_min_loop), .amplitude_max(adaptive_amp_max_loop),
+    .frequency_abs_sum(adaptive_freq_abs_sum_loop),
+    .frequency_abs_max(adaptive_freq_abs_max_loop),
+    .phase_abs_sum(adaptive_phase_abs_sum_loop), .phase_abs_max(adaptive_phase_abs_max_loop),
+    .output_min(adaptive_output_min_loop), .output_max(adaptive_output_max_loop),
+    .locked_sample_count(adaptive_locked_samples_loop),
+    .positive_rail_sample_count(adaptive_pos_rail_samples_loop),
+    .negative_rail_sample_count(adaptive_neg_rail_samples_loop),
+    .frequency_bad_sample_count(adaptive_freq_bad_samples_loop),
+    .phase_bad_sample_count(adaptive_phase_bad_samples_loop),
+    .loss_of_lock_event_count(adaptive_loss_lock_events_loop),
+    .positive_rail_event_count(adaptive_pos_rail_events_loop),
+    .negative_rail_event_count(adaptive_neg_rail_events_loop)
+);
+
+assign adaptive_snapshot_source_bundle = {
+    adaptive_snapshot_seq_loop, adaptive_snapshot_samples_loop, adaptive_amp_sum_loop,
+    adaptive_amp_min_loop, adaptive_amp_max_loop, adaptive_freq_abs_sum_loop,
+    adaptive_freq_abs_max_loop, adaptive_phase_abs_sum_loop, adaptive_phase_abs_max_loop,
+    adaptive_output_min_loop, adaptive_output_max_loop, adaptive_locked_samples_loop,
+    adaptive_pos_rail_samples_loop, adaptive_neg_rail_samples_loop,
+    adaptive_freq_bad_samples_loop, adaptive_phase_bad_samples_loop,
+    adaptive_loss_lock_events_loop, adaptive_pos_rail_events_loop,
+    adaptive_neg_rail_events_loop
+};
+
+// 只对 toggle 使用两级同步器；宽数据依靠快照保持时间完成 bundled-data CDC。
+adaptive_snapshot_cdc #(.DATA_WIDTH(672)) adaptive_statistics_cdc (
+    .dst_clk(clk1), .dst_reset_n(rst), .src_toggle(adaptive_snapshot_toggle_loop),
+    .src_data(adaptive_snapshot_source_bundle), .dst_data(adaptive_snapshot_bus_bundle)
+);
+
+assign {
+    adaptive_snapshot_seq, adaptive_snapshot_samples, adaptive_amp_sum,
+    adaptive_amp_min, adaptive_amp_max, adaptive_freq_abs_sum,
+    adaptive_freq_abs_max, adaptive_phase_abs_sum, adaptive_phase_abs_max,
+    adaptive_output_min, adaptive_output_max, adaptive_locked_samples,
+    adaptive_pos_rail_samples, adaptive_neg_rail_samples, adaptive_freq_bad_samples,
+    adaptive_phase_bad_samples, adaptive_loss_lock_events, adaptive_pos_rail_events,
+    adaptive_neg_rail_events
+} = adaptive_snapshot_bus_bundle;
+
 always @(posedge clk1)
 if (rst == 1'b0) begin
    sys_err <= 1'b0 ;
@@ -832,6 +935,23 @@ end else begin
         16'h0050 : begin sys_ack <= sys_en;          sys_rdata <= phase_residuals0_threshold;           end 
         16'h0051 : begin sys_ack <= sys_en;          sys_rdata <= phase_residuals0_offset;              end 
         16'h0052 : begin sys_ack <= sys_en;          sys_rdata <= freq_residuals0_threshold;            end 
+
+        16'h0060 : begin sys_ack <= sys_en;          sys_rdata <= 32'hAD030001;                         end
+        16'h0061 : begin sys_ack <= sys_en;          sys_rdata <= {24'd0, adaptive_shadow_profile};     end
+        16'h0062 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_shadow_kp;                   end
+        16'h0063 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_shadow_ki;                   end
+        16'h0064 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_shadow_kii;                  end
+        16'h0065 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_shadow_kd;                   end
+        16'h0066 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_shadow_dcoef;                end
+        16'h0067 : begin sys_ack <= sys_en;          sys_rdata <= 32'd0;                               end
+        16'h0068 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_applied_seq;                 end
+        16'h0069 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_apply_status;                end
+        16'h006A : begin sys_ack <= sys_en;          sys_rdata <= {24'd0, adaptive_active_profile};     end
+        16'h006B : begin sys_ack <= sys_en;          sys_rdata <= adaptive_active_kp;                   end
+        16'h006C : begin sys_ack <= sys_en;          sys_rdata <= adaptive_active_ki;                   end
+        16'h006D : begin sys_ack <= sys_en;          sys_rdata <= adaptive_active_kii;                  end
+        16'h006E : begin sys_ack <= sys_en;          sys_rdata <= adaptive_active_kd;                   end
+        16'h006F : begin sys_ack <= sys_en;          sys_rdata <= adaptive_active_dcoef;                end
         //纯读取
         //pll0_locked-瞬时锁定 LED_R0-长时不锁定 pll0_lock-PLL启动使能 LED_G0-长时锁定 
         //16'h0100 : begin sys_ack <= sys_en;          sys_rdata <= {{32-6{1'b0}}, pll0_locked,LED_R0,pll0_lock,LED_G0,dac0_railed_positive,dac0_railed_negative,residuals0_are_above_threshold_freq,residuals0_are_above_threshold_phase};     end//系统状态
@@ -846,7 +966,29 @@ end else begin
         16'h0105 : begin sys_ack <= sys_en;          sys_rdata <=  PID_OUT_With_Limit;                  end
         16'h0106 : begin sys_ack <= sys_en;          sys_rdata <=  phase_residuals0;                    end
         16'h0107 : begin sys_ack <= sys_en;          sys_rdata <=  pll_output_average_value;            end
-        16'h01FF : begin sys_ack <= sys_en;          sys_rdata <=  32'h0x7FFFFFFF;                      end
+        16'h0120 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_snapshot_seq;                end
+        16'h0121 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_snapshot_samples;            end
+        16'h0122 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_amp_sum[31:0];               end
+        16'h0123 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_amp_sum[63:32];              end
+        16'h0124 : begin sys_ack <= sys_en;          sys_rdata <= {adaptive_amp_max, adaptive_amp_min}; end
+        16'h0125 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_freq_abs_sum[31:0];          end
+        16'h0126 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_freq_abs_sum[63:32];         end
+        16'h0127 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_freq_abs_max;                end
+        16'h0128 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_phase_abs_sum[31:0];         end
+        16'h0129 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_phase_abs_sum[63:32];        end
+        16'h012A : begin sys_ack <= sys_en;          sys_rdata <= adaptive_phase_abs_max;               end
+        16'h012B : begin sys_ack <= sys_en;          sys_rdata <= adaptive_output_min;                  end
+        16'h012C : begin sys_ack <= sys_en;          sys_rdata <= adaptive_output_max;                  end
+        16'h012D : begin sys_ack <= sys_en;          sys_rdata <= adaptive_locked_samples;              end
+        16'h012E : begin sys_ack <= sys_en;          sys_rdata <= adaptive_pos_rail_samples;            end
+        16'h012F : begin sys_ack <= sys_en;          sys_rdata <= adaptive_neg_rail_samples;            end
+        16'h0130 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_freq_bad_samples;            end
+        16'h0131 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_phase_bad_samples;           end
+        16'h0132 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_loss_lock_events;            end
+        16'h0133 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_pos_rail_events;             end
+        16'h0134 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_neg_rail_events;             end
+        16'h0135 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_commit_error_count;          end
+        16'h01FF : begin sys_ack <= sys_en;          sys_rdata <= 32'h7FFFFFFF;                         end
 
         default  : begin sys_ack <= sys_en;          sys_rdata <=  32'h0;                               end
    endcase
