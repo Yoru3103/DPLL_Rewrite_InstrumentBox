@@ -66,6 +66,39 @@ int AdaptivePl_Probe(u32 baseAddress)
 		ADAPTIVE_PL_OK : ADAPTIVE_PL_NOT_PRESENT;
 }
 
+int AdaptivePl_ReadActive(u32 baseAddress, AdaptivePlParameters *parameters,
+		u32 *appliedSequence, u32 *applyStatus, u32 maximumAttempts)
+{
+	u32 attempt;
+	u32 sequenceBefore;
+	u32 sequenceAfter;
+
+	if ((parameters == 0) || (appliedSequence == 0) || (applyStatus == 0) ||
+		(maximumAttempts == 0U))
+		return ADAPTIVE_PL_INVALID_ARGUMENT;
+	if (AdaptivePl_Probe(baseAddress) != ADAPTIVE_PL_OK)
+		return ADAPTIVE_PL_NOT_PRESENT;
+
+	/* APPLIED_SEQ brackets the active-register reads so one result is coherent. */
+	for (attempt = 0U; attempt < maximumAttempts; ++attempt) {
+		sequenceBefore = AdaptivePl_Read(baseAddress, REG_APPLIED_SEQ);
+		*applyStatus = AdaptivePl_Read(baseAddress, REG_APPLY_STATUS);
+		parameters->profileId = (u8)AdaptivePl_Read(baseAddress, REG_ACTIVE_PROFILE);
+		parameters->kp = AdaptivePl_Read(baseAddress, REG_ACTIVE_KP);
+		parameters->ki = AdaptivePl_Read(baseAddress, REG_ACTIVE_KI);
+		parameters->kii = AdaptivePl_Read(baseAddress, REG_ACTIVE_KII);
+		parameters->kd = AdaptivePl_Read(baseAddress, REG_ACTIVE_KD);
+		parameters->dCoefficient = AdaptivePl_Read(baseAddress, REG_ACTIVE_DCOEF) & 0x3FFFFU;
+		sequenceAfter = AdaptivePl_Read(baseAddress, REG_APPLIED_SEQ);
+		if (sequenceBefore == sequenceAfter) {
+			*appliedSequence = sequenceAfter;
+			return ADAPTIVE_PL_OK;
+		}
+	}
+
+	return ADAPTIVE_PL_VERIFY_ERROR;
+}
+
 int AdaptivePl_Commit(u32 baseAddress, const AdaptivePlParameters *parameters,
 		u32 commitSequence, u32 maximumPolls)
 {
@@ -80,6 +113,13 @@ int AdaptivePl_Commit(u32 baseAddress, const AdaptivePlParameters *parameters,
 	status = AdaptivePl_Read(baseAddress, REG_APPLY_STATUS);
 	if ((status & ADAPTIVE_PL_STATUS_BUSY) != 0U)
 		return ADAPTIVE_PL_BUSY;
+	/* Clear a previous transaction's sticky error before judging this commit. */
+	if ((status & ADAPTIVE_PL_STATUS_ERROR) != 0U) {
+		AdaptivePl_Write(baseAddress, REG_APPLY_STATUS, ADAPTIVE_PL_STATUS_ERROR);
+		status = AdaptivePl_Read(baseAddress, REG_APPLY_STATUS);
+		if ((status & ADAPTIVE_PL_STATUS_ERROR) != 0U)
+			return ADAPTIVE_PL_VERIFY_ERROR;
+	}
 	if (AdaptivePl_Read(baseAddress, REG_APPLIED_SEQ) == commitSequence)
 		return ADAPTIVE_PL_VERIFY_ERROR;
 

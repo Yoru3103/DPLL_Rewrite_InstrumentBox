@@ -1,12 +1,12 @@
 # DPLL 自适应调参执行方案
 
-> 文档状态：执行稿 v0.6
+> 文档状态：执行稿 v0.7
 >
 > PS 基线：`DPLL_2COM_v2`
 >
 > FPGA 工程：Vivado 2018.3
 >
-> 更新日期：2026-08-28
+> 更新日期：2026-09-01
 
 ## 1. 项目目标
 
@@ -74,6 +74,110 @@ PL（观测与安全执行）
 | BOOT_AND_RECOVER | 开机运行，并在确认失锁后申请重调 | 最终目标 |
 
 UART 处理必须保持非阻塞。自调状态机由主循环周期推进，不能在命令回调中长时间采样或等待锁定。
+
+### 4.1 串口与通用帧格式
+
+上位机使用 PS UART0 通信，参数为 `921600 baud、8 data bits、no parity、1 stop bit`。
+
+| 字节偏移 | 请求帧 | 响应帧 | 说明 |
+|---:|---:|---:|---|
+| 0 | `0xC6` | `0xA2` | 帧头 |
+| 1 | `CHECKSUM` | `CHECKSUM` | 从 `CMD` 到最后一个 payload 字节的累加和低 8 bit |
+| 2 | `CMD` | `CMD` | 命令字，响应通常回显请求命令 |
+| 3 | `LEN` | `LEN` | payload 字节数 |
+| 4～ | `PAYLOAD` | `PAYLOAD` | 命令参数或返回数据 |
+
+所有多字节整数均使用小端序。PS 当前接收缓冲检查要求完整请求帧不超过 48 字节，因此上位机发送 payload 应限制在 44 字节以内；现有命令最大 payload 为 16 字节。
+
+请求校验计算式：
+
+```text
+CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
+```
+
+例如，启动测频回路自调的完整发送帧为 `C6 99 97 01 01`；查询锁相回路自调状态的发送帧为 `C6 99 98 01 00`。
+
+### 4.2 当前上位机命令表
+
+| CMD | 方向 | 请求 payload | 响应 payload | 功能 |
+|---:|---|---|---|---|
+| `0x03` | 读 | 无 | `center:u32` | 读取锁相回路中心频率 |
+| `0x07` | 读 | 无 | `Kp,Ki,Kii,Kd`，各 `u32` | 读取锁相回路当前实际生效 PID |
+| `0x09` | 读 | 无 | 输出、相位残差、瞬时频率、状态 | 读取锁相回路运行状态 |
+| `0x0A` | 读 | 无 | `version:u8` | 读取 PS 协议/程序版本 |
+| `0x10` | 读 | 无 | `center:u32` | 读取测频回路中心频率 |
+| `0x13` | 读 | 无 | `Kp,Ki,Kii,Kd`，各 `u32` | 读取测频回路当前实际生效 PID |
+| `0x14` | 读 | 无 | 相位残差、瞬时频率、状态 | 读取测频回路运行状态 |
+| `0x82` | 写 | `center:u32` | `ACK:u8` | 设置锁相回路中心频率 |
+| `0x86` | 写 | `Kp,Ki,Kii,Kd`，各 `u32` | `ACK:u8` | 手动设置锁相回路 PID |
+| `0x8A` | 写 | 无 | `ACK:u8` | 开启锁相回路 |
+| `0x8B` | 写 | 无 | `ACK:u8` | 关闭锁相回路 |
+| `0x90` | 写 | `center:u32` | `ACK:u8` | 设置测频回路中心频率 |
+| `0x93` | 写 | `Kp,Ki,Kii,Kd`，各 `u32` | `ACK:u8` | 手动设置测频回路 PID |
+| `0x96` | 写 | 无 | `ACK:u8` | 复位并重新开启测频回路 |
+| `0x97` | 双向 | 自调 action | 18 字节自调状态 | 控制或查询测频回路自调 |
+| `0x98` | 双向 | 自调 action | 18 字节自调状态 | 控制或查询锁相回路自调 |
+
+普通写命令的 `ACK=0` 表示接受成功，非零值表示设备拒绝或执行错误。
+
+### 4.3 自调命令 payload
+
+`0x97` 和 `0x98` 使用同一套 payload：
+
+| Action | 请求 payload | 功能 |
+|---:|---|---|
+| `0x00 QUERY` | `00` | 查询当前状态，不改变任务 |
+| `0x01 START` | `01` | 启动目标回路自调 |
+| `0x02 CANCEL` | `02` | 请求取消，状态机随后回退 ORIGINAL |
+| `0x03 CLEAR` | `03` | 空闲时清除 DONE/FAILED 和历史结果 |
+| `0x04 SET_POLICY` | `04 policy` | 设置策略：`0=HOST_ONLY`、`1=BOOT_ONCE`、`2=BOOT_AND_RECOVER` |
+
+当前正式使用策略仍为 `HOST_ONLY`。`BOOT_ONCE` 和 `BOOT_AND_RECOVER` 只保留协议入口，需完成后续验证后启用。
+
+### 4.4 自调响应 payload
+
+`0x97/0x98` 固定返回 18 字节 payload：
+
+| payload 偏移 | 长度 | 字段 | 说明 |
+|---:|---:|---|---|
+| 0 | 1 | `protocol_version` | 当前为 1 |
+| 1 | 1 | `action` | 本次响应对应的 action |
+| 2 | 4 | `status_word` | 状态位，小端序 |
+| 6 | 1 | `progress` | 进度 0～100 |
+| 7 | 1 | `current_profile` | 当前正在评价的 profile ID |
+| 8 | 1 | `active_profile` | 当前硬件生效的 profile ID |
+| 9 | 1 | `best_profile` | 当前最佳 profile ID |
+| 10 | 2 | `current_score` | 当前评分，饱和到 `0xFFFF` |
+| 12 | 2 | `best_score` | 最佳评分，饱和到 `0xFFFF` |
+| 14 | 4 | `elapsed_ms` | 本次任务运行时间，小端序 |
+
+`status_word` 定义：
+
+| 位 | 含义 |
+|---:|---|
+| 0 | `DONE`，任务正常完成 |
+| 1 | `BUSY`，任务正在运行 |
+| 2 | `FAILED`，任务失败 |
+| 3 | `PARAMS_VALID`，当前参数已通过验证 |
+| 4 | `LOCK_VALID`，当前锁定状态有效 |
+| 5 | `RETUNE_PENDING`，存在重调申请 |
+| 6 | 已启用失锁恢复策略 |
+| 7 | 已启用非 HOST_ONLY 自动策略 |
+| 8～11 | 执行状态 `execState` |
+| 12～15 | 健康状态 `healthState` |
+| 16～23 | 结果码 `result` |
+| 24～31 | `runId`，用于区分不同自调任务 |
+
+响应枚举值对照：
+
+| 字段 | 数值定义 |
+|---|---|
+| `execState` | `0 IDLE`、`1 PRECHECK`、`2 BASELINE`、`3 APPLY_CANDIDATE`、`4 SETTLE`、`5 EVALUATE`、`6 NEXT_CANDIDATE`、`7 SELECT_BEST`、`8 APPLY_BEST`、`9 VERIFY`、`10 ROLLBACK`、`11 DONE`、`12 FAILED`、`13 CANCELED` |
+| `healthState` | `0 UNINITIALIZED`、`1 VALID`、`2 DEGRADED`、`3 LOST`、`4 RETUNE_PENDING`、`5 FAULT` |
+| `result` | `0 NONE`、`1 SUCCESS`、`2 ACCEPTED`、`3 BUSY`、`4 REJECTED`、`5 INVALID_ACTION`、`6 INVALID_POLICY`、`7 NOT_LOCKED`、`8 READBACK_ERROR`、`9 CANCELED` |
+| `profile ID` | `0 ORIGINAL`、`1 SAFE`、`2 TRACK_WEAK`、`3 TRACK_MEDIUM`、`4 TRACK_STRONG`、`5 ACQUIRE`、`0xFF NONE` |
+
+上位机判断自调可用应同时检查 `DONE=1`、`PARAMS_VALID=1` 和 `LOCK_VALID=1`，不能只检查历史 DONE 位。
 
 ## 5. 参数选择策略
 
@@ -146,11 +250,11 @@ ROLLBACK → FAILED / CANCELED
 | 0 | 原系统与 PS v2 基线 | 已完成，不再重复验证 |
 | 1 | 双 UART 异步命令、状态机和完成标志 | 已完成 |
 | 2 | 方案 B 参数扫描与 Python 上位机 | 用户确认本阶段结束；实测结果暂不采用 |
-| 3 | PL 统计快照、原子提交、CDC 和 PS HAL | 源码及离线验证完成，等待评审/完整工程实现 |
-| 4 | 状态机切换到方案 C、在线 profile 调度 | 待实施 |
+| 3 | PL 统计快照、原子提交、CDC 和 PS HAL | 已提交，完整工程实现与板上验收待执行 |
+| 4 | PS 状态机接入方案 C 接口 | 代码已完成，待 SDK 完整构建与上板验证 |
 | 5 | Kii、Kd、温漂和更高级策略 | 未来扩展 |
 
-阶段 3 的模块职责、接口分区和后续接入方式见 [ADAPTIVE_DPLL_STAGE3_MODULES.md](ADAPTIVE_DPLL_STAGE3_MODULES.md)。
+阶段 3 的模块职责见 [ADAPTIVE_DPLL_STAGE3_MODULES.md](ADAPTIVE_DPLL_STAGE3_MODULES.md)。阶段 4 的接入边界见 [ADAPTIVE_DPLL_STAGE4_PS_INTEGRATION.md](ADAPTIVE_DPLL_STAGE4_PS_INTEGRATION.md)。
 
 ## 10. 验收要求
 

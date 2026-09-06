@@ -13,6 +13,7 @@
 #include "xuartps.h"
 #include "xuartps_hw.h"
 #include "xtime_l.h"
+#include "AdaptivePlIf.h"
 
 XUartPs XUartPs_uart0;
 XUartPs XUartPs_uart1;
@@ -279,6 +280,8 @@ void PC_HOST_CMD_Get(void)
 #define AUTOTUNE_PROFILE_ORIGINAL       0U
 #define AUTOTUNE_PROFILE_NONE           0xFFU					// 表示当前没有有效的profile
 #define AUTOTUNE_CANDIDATE_COUNT        4U
+#define AUTOTUNE_PL_READ_ATTEMPTS       3U
+#define AUTOTUNE_PL_COMMIT_MAX_POLLS    100000U
 
 typedef enum {
 	AUTOTUNE_TARGET_FREQ = 0,
@@ -407,6 +410,8 @@ typedef struct {
 	u32 runStartMs;							// 任务开始时间
 	u32 stateStartMs;						// 状态开始时间
 	u32 lastServiceMs;						// 上次任务执行时间
+	u32 lastSnapshotSeq;					// 最近一次已合并的PL统计快照序号
+	u32 nextCommitSeq;						// 下一次原子参数提交事务序号，0保留不用
 
 
 	u32 currentScore;						// 当前profile评分
@@ -429,6 +434,7 @@ typedef struct {
 	u8 retunePending;						// 检测到需要重新调参
 	u8 cancelRequested;						// PC取消请求
 	u8 originalProfileValid;				// 原始profile保存了有效参数
+	u8 plAdaptiveAvailable;					// 1：Stage 3接口存在；0：回退到方案B
 } AutotuneContext;
 
 static AutotuneContext FreqAutotune;
@@ -499,6 +505,11 @@ static u32 Autotune_SettleTimeMs(const AutotuneContext *ctx)
 	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? 300U : 800U;
 }
 
+static u32 Autotune_PlBase(const AutotuneContext *ctx)
+{
+	return (ctx->target == AUTOTUNE_TARGET_FREQ) ? FREQ_METER_BASE_ADDR : DPLL_BASE_ADDR;
+}
+
 static const AutotuneProfile *Autotune_Candidate(const AutotuneContext *ctx)
 {
 	return (ctx->target == AUTOTUNE_TARGET_FREQ) ?
@@ -508,6 +519,20 @@ static const AutotuneProfile *Autotune_Candidate(const AutotuneContext *ctx)
 // 读取当前PID参数
 static void Autotune_ReadProfile(const AutotuneContext *ctx, AutotuneProfile *profile)
 {
+	AdaptivePlParameters active;
+	u32 appliedSequence;
+	u32 applyStatus;
+	if(ctx->plAdaptiveAvailable &&
+		AdaptivePl_ReadActive(Autotune_PlBase(ctx), &active, &appliedSequence,
+			&applyStatus, AUTOTUNE_PL_READ_ATTEMPTS) == ADAPTIVE_PL_OK &&
+		((applyStatus & ADAPTIVE_PL_STATUS_ACTIVE) != 0U)) {
+		profile->kp = active.kp;
+		profile->ki = active.ki;
+		profile->kii = active.kii;
+		profile->kd = active.kd;
+		profile->dCoeff = active.dCoefficient;
+		return;
+	}
 	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
 		profile->kp = Xil_In32(Freq_Meter_PID_GainP_Addr);
 		profile->ki = Xil_In32(Freq_Meter_PID_GainI_Addr);
@@ -529,10 +554,36 @@ static int Autotune_ProfileEqual(const AutotuneProfile *left, const AutotuneProf
 		left->kd == right->kd && left->dCoeff == right->dCoeff;
 }
 
-/* Scheme B transaction: only the selected loop is unlocked and all fields are verified. */
-static int Autotune_ApplyProfile(AutotuneContext *ctx, const AutotuneProfile *profile)
+/* Stage 4 uses the atomic PL interface when present and keeps Scheme B as fallback. */
+static int Autotune_ApplyProfile(AutotuneContext *ctx, const AutotuneProfile *profile,
+		u8 profileId)
 {
 	AutotuneProfile active;
+	AdaptivePlParameters parameters;
+	u32 commitSequence;
+	int commitResult;
+
+	if(ctx->plAdaptiveAvailable) {
+		parameters.profileId = profileId;
+		parameters.kp = profile->kp;
+		parameters.ki = profile->ki;
+		parameters.kii = profile->kii;
+		parameters.kd = profile->kd;
+		parameters.dCoefficient = profile->dCoeff;
+		commitSequence = ctx->nextCommitSeq;
+		ctx->nextCommitSeq++;
+		if(ctx->nextCommitSeq == 0U) ctx->nextCommitSeq = 1U;
+
+		ctx->originalManualOffset = Xil_In32(Autotune_ManualOffsetAddr(ctx));
+		Xil_Out32(Autotune_LockAddr(ctx), 0U);
+		commitResult = AdaptivePl_Commit(Autotune_PlBase(ctx), &parameters,
+			commitSequence, AUTOTUNE_PL_COMMIT_MAX_POLLS);
+		Xil_Out32(Autotune_ManualOffsetAddr(ctx), ctx->originalManualOffset);
+		Xil_Out32(Autotune_LockAddr(ctx), 1U);
+		return (commitResult == ADAPTIVE_PL_OK) &&
+			((Xil_In32(Autotune_LockAddr(ctx)) & 1U) != 0U);
+	}
+
 	Autotune_ReadProfile(ctx, &active);
 	if(Autotune_ProfileEqual(&active, profile)) return 1;
 
@@ -575,8 +626,58 @@ static void Autotune_ResetMetrics(AutotuneMetrics *metrics)
 	metrics->residualBadCount = 0U;
 }
 
+/* Discard the snapshot already completed before a new evaluation window starts. */
+static void Autotune_BeginMetrics(AutotuneContext *ctx)
+{
+	AdaptivePlSnapshot snapshot;
+	Autotune_ResetMetrics(&ctx->metrics);
+	ctx->lastSnapshotSeq = 0U;
+	if(ctx->plAdaptiveAvailable &&
+		AdaptivePl_ReadSnapshot(Autotune_PlBase(ctx), &snapshot,
+			AUTOTUNE_PL_READ_ATTEMPTS) == ADAPTIVE_PL_OK)
+		ctx->lastSnapshotSeq = snapshot.sequence;
+}
+
+static void Autotune_MergeSnapshot(AutotuneContext *ctx,
+		const AdaptivePlSnapshot *snapshot)
+{
+	u32 railCount;
+	u32 residualBadCount;
+	if(snapshot->sampleCount == 0U) return;
+
+	railCount = snapshot->positiveRailSampleCount + snapshot->negativeRailSampleCount;
+	if(railCount < snapshot->positiveRailSampleCount || railCount > snapshot->sampleCount)
+		railCount = snapshot->sampleCount;
+	residualBadCount = snapshot->frequencyBadSampleCount + snapshot->phaseBadSampleCount;
+	if(residualBadCount < snapshot->frequencyBadSampleCount ||
+		residualBadCount > snapshot->sampleCount)
+		residualBadCount = snapshot->sampleCount;
+
+	ctx->metrics.amplitudeSum += snapshot->amplitudeSum;
+	ctx->metrics.absFreqSum += snapshot->frequencyAbsSum;
+	ctx->metrics.absPhaseSum += snapshot->phaseAbsSum;
+	if(snapshot->amplitudeMin < ctx->metrics.amplitudeMin)
+		ctx->metrics.amplitudeMin = snapshot->amplitudeMin;
+	if(snapshot->amplitudeMax > ctx->metrics.amplitudeMax)
+		ctx->metrics.amplitudeMax = snapshot->amplitudeMax;
+	if(snapshot->frequencyAbsMax > ctx->metrics.absFreqMax)
+		ctx->metrics.absFreqMax = snapshot->frequencyAbsMax;
+	if(snapshot->phaseAbsMax > ctx->metrics.absPhaseMax)
+		ctx->metrics.absPhaseMax = snapshot->phaseAbsMax;
+	if(snapshot->outputMin < ctx->metrics.outputMin)
+		ctx->metrics.outputMin = snapshot->outputMin;
+	if(snapshot->outputMax > ctx->metrics.outputMax)
+		ctx->metrics.outputMax = snapshot->outputMax;
+	ctx->metrics.sampleCount += snapshot->sampleCount;
+	ctx->metrics.lockedCount += (snapshot->lockedSampleCount > snapshot->sampleCount) ?
+		snapshot->sampleCount : snapshot->lockedSampleCount;
+	ctx->metrics.railCount += railCount;
+	ctx->metrics.residualBadCount += residualBadCount;
+}
+
 static void Autotune_Sample(AutotuneContext *ctx)
 {
+	AdaptivePlSnapshot snapshot;
 	u32 amplitude;
 	u32 frequency;
 	u32 phase;
@@ -584,6 +685,15 @@ static void Autotune_Sample(AutotuneContext *ctx)
 	u32 absFrequency;
 	u32 absPhase;
 	s32 output;
+	if(ctx->plAdaptiveAvailable) {
+		if(AdaptivePl_ReadSnapshot(Autotune_PlBase(ctx), &snapshot,
+			AUTOTUNE_PL_READ_ATTEMPTS) != ADAPTIVE_PL_OK)
+			return;
+		if(snapshot.sequence == ctx->lastSnapshotSeq) return;
+		ctx->lastSnapshotSeq = snapshot.sequence;
+		Autotune_MergeSnapshot(ctx, &snapshot);
+		return;
+	}
 	if(ctx->target == AUTOTUNE_TARGET_FREQ) {
 		amplitude = Xil_In32(Freq_Meter_Amplitude_Addr) & 0xFFFFU;
 		frequency = Xil_In32(Freq_Meter_inst_frequency_Addr);
@@ -634,9 +744,11 @@ static int Autotune_MetricsQualified(const AutotuneContext *ctx, int baseline)
 	u32 amplitudeMean;
 	const AutotuneMetrics *metrics = &ctx->metrics;
 	if(metrics->sampleCount < AUTOTUNE_MIN_SAMPLES) return 0;
-	if(metrics->lockedCount * 100U < metrics->sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) return 0;
+	if((u64)metrics->lockedCount * 100U <
+		(u64)metrics->sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) return 0;
 	if(metrics->railCount != 0U) return 0;
-	if(metrics->residualBadCount * 100U > metrics->sampleCount * AUTOTUNE_MAX_RESIDUAL_PERCENT) return 0;
+	if((u64)metrics->residualBadCount * 100U >
+		(u64)metrics->sampleCount * AUTOTUNE_MAX_RESIDUAL_PERCENT) return 0;
 	if(!baseline && ctx->baselineAmplitudeMean != 0U) {
 		amplitudeMean = (u32)(metrics->amplitudeSum / metrics->sampleCount);
 		if(amplitudeMean * 2U < ctx->baselineAmplitudeMean) return 0;
@@ -860,7 +972,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 			break;
 		}
 		ctx->progress = 5U;
-		Autotune_ResetMetrics(&ctx->metrics);
+		Autotune_BeginMetrics(ctx);
 		Autotune_SetState(ctx, AUTOTUNE_EXEC_BASELINE, now);
 		break;
 	case AUTOTUNE_EXEC_BASELINE:
@@ -884,7 +996,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 	case AUTOTUNE_EXEC_APPLY_CANDIDATE:
 		candidate = Autotune_Candidate(ctx);
 		ctx->currentProfileId = ctx->candidateIndex + 1U;
-		if(!Autotune_ApplyProfile(ctx, candidate)) {
+		if(!Autotune_ApplyProfile(ctx, candidate, ctx->currentProfileId)) {
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 		} else {
 			ctx->activeProfileId = ctx->currentProfileId;
@@ -900,7 +1012,7 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 				if(ctx->candidateIndex == 0U) Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 				else Autotune_SetState(ctx, AUTOTUNE_EXEC_NEXT_CANDIDATE, now);
 			} else {
-				Autotune_ResetMetrics(&ctx->metrics);
+				Autotune_BeginMetrics(ctx);
 				Autotune_SetState(ctx, AUTOTUNE_EXEC_EVALUATE, now);
 			}
 		}
@@ -918,7 +1030,8 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 				ctx->bestProfileId = ctx->currentProfileId;
 			}
 			if(ctx->candidateIndex == 0U &&
-				ctx->metrics.lockedCount * 100U < ctx->metrics.sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) {
+				(u64)ctx->metrics.lockedCount * 100U <
+				(u64)ctx->metrics.sampleCount * AUTOTUNE_MIN_LOCK_PERCENT) {
 				Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 			} else {
 				Autotune_SetState(ctx, AUTOTUNE_EXEC_NEXT_CANDIDATE, now);
@@ -938,12 +1051,12 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 		Autotune_SetState(ctx, AUTOTUNE_EXEC_APPLY_BEST, now);
 		break;
 	case AUTOTUNE_EXEC_APPLY_BEST:
-		if(!Autotune_ApplyProfile(ctx, &ctx->bestProfile)) {
+		if(!Autotune_ApplyProfile(ctx, &ctx->bestProfile, ctx->bestProfileId)) {
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_ROLLBACK, now);
 		} else {
 			ctx->activeProfileId = ctx->bestProfileId;
 			ctx->progress = 80U;
-			Autotune_ResetMetrics(&ctx->metrics);
+			Autotune_BeginMetrics(ctx);
 			Autotune_SetState(ctx, AUTOTUNE_EXEC_VERIFY, now);
 		}
 		break;
@@ -968,7 +1081,8 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 		}
 		break;
 	case AUTOTUNE_EXEC_ROLLBACK:
-		if(ctx->originalProfileValid && !Autotune_ApplyProfile(ctx, &ctx->originalProfile)) {
+		if(ctx->originalProfileValid && !Autotune_ApplyProfile(ctx,
+			&ctx->originalProfile, AUTOTUNE_PROFILE_ORIGINAL)) {
 			Autotune_Fail(ctx, AUTOTUNE_RESULT_READBACK_ERROR, now);
 		} else if(ctx->cancelRequested) {
 			ctx->activeProfileId = AUTOTUNE_PROFILE_ORIGINAL;
@@ -990,8 +1104,19 @@ static void Autotune_Task(AutotuneContext *ctx, u32 now)
 
 static void Autotune_InitContext(AutotuneContext *ctx, AutotuneTarget target)
 {
+	AdaptivePlParameters active;
+	u32 appliedSequence = 0U;
+	u32 applyStatus;
 	u32 now = Autotune_Millis();
 	ctx->target = target;
+	ctx->plAdaptiveAvailable =
+		(AdaptivePl_Probe(Autotune_PlBase(ctx)) == ADAPTIVE_PL_OK) ? 1U : 0U;
+	if(ctx->plAdaptiveAvailable)
+		(void)AdaptivePl_ReadActive(Autotune_PlBase(ctx), &active, &appliedSequence,
+			&applyStatus, AUTOTUNE_PL_READ_ATTEMPTS);
+	ctx->nextCommitSeq = appliedSequence + 1U;
+	if(ctx->nextCommitSeq == 0U) ctx->nextCommitSeq = 1U;
+	ctx->lastSnapshotSeq = 0U;
 	ctx->policy = AUTOTUNE_POLICY_HOST_ONLY;
 	ctx->execState = AUTOTUNE_EXEC_IDLE;
 	ctx->healthState = AUTOTUNE_HEALTH_UNINITIALIZED;
@@ -1116,23 +1241,25 @@ void CMD_06_READ_PLL_LIMIT_SETTING(void)
 }
 void CMD_07_READ_PLL_PID_SETTING(void)
 {
+	AutotuneProfile profile;
 	uint32_t i;
-	i = Xil_In32(PLL0_PID_GainP_Addr);
+	Autotune_ReadProfile(&DpllAutotune, &profile);
+	i = profile.kp;
 	Uart0_TX_Buff[4] = i&0xFF;
 	Uart0_TX_Buff[5] = (i>>8)&0xFF;
 	Uart0_TX_Buff[6] = (i>>16)&0xFF;
 	Uart0_TX_Buff[7] = (i>>24)&0xFF;
-	i = Xil_In32(PLL0_PID_GainI_Addr);
+	i = profile.ki;
 	Uart0_TX_Buff[8] = i&0xFF;
 	Uart0_TX_Buff[9] = (i>>8)&0xFF;
 	Uart0_TX_Buff[10] = (i>>16)&0xFF;
 	Uart0_TX_Buff[11] = (i>>24)&0xFF;
-	i = Xil_In32(PLL0_PID_GainI2_Addr);
+	i = profile.kii;
 	Uart0_TX_Buff[12] = i&0xFF;
 	Uart0_TX_Buff[13] = (i>>8)&0xFF;
 	Uart0_TX_Buff[14] = (i>>16)&0xFF;
 	Uart0_TX_Buff[15] = (i>>24)&0xFF;
-	i = Xil_In32(PLL0_PID_GainD_Addr);
+	i = profile.kd;
 	Uart0_TX_Buff[16] = i&0xFF;
 	Uart0_TX_Buff[17] = (i>>8)&0xFF;
 	Uart0_TX_Buff[18] = (i>>16)&0xFF;
@@ -1254,23 +1381,25 @@ void CMD_12_READ_FREQMETER_LIMIT_SETTING(void)
 }
 void CMD_13_READ_FREQMETER_PID_SETTING(void)
 {
+	AutotuneProfile profile;
 	uint32_t i;
-	i = Xil_In32(Freq_Meter_PID_GainP_Addr);
+	Autotune_ReadProfile(&FreqAutotune, &profile);
+	i = profile.kp;
 	Uart0_TX_Buff[4] = i&0xFF;
 	Uart0_TX_Buff[5] = (i>>8)&0xFF;
 	Uart0_TX_Buff[6] = (i>>16)&0xFF;
 	Uart0_TX_Buff[7] = (i>>24)&0xFF;
-	i = Xil_In32(Freq_Meter_PID_GainI_Addr);
+	i = profile.ki;
 	Uart0_TX_Buff[8] = i&0xFF;
 	Uart0_TX_Buff[9] = (i>>8)&0xFF;
 	Uart0_TX_Buff[10] = (i>>16)&0xFF;
 	Uart0_TX_Buff[11] = (i>>24)&0xFF;
-	i = Xil_In32(Freq_Meter_PID_GainI2_Addr);
+	i = profile.kii;
 	Uart0_TX_Buff[12] = i&0xFF;
 	Uart0_TX_Buff[13] = (i>>8)&0xFF;
 	Uart0_TX_Buff[14] = (i>>16)&0xFF;
 	Uart0_TX_Buff[15] = (i>>24)&0xFF;
-	i = Xil_In32(Freq_Meter_PID_GainD_Addr);
+	i = profile.kd;
 	Uart0_TX_Buff[16] = i&0xFF;
 	Uart0_TX_Buff[17] = (i>>8)&0xFF;
 	Uart0_TX_Buff[18] = (i>>16)&0xFF;

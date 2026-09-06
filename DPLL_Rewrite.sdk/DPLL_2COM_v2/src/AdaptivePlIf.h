@@ -51,6 +51,8 @@ typedef enum {
 } AdaptivePlResult;
 
 int AdaptivePl_Probe(u32 baseAddress);
+int AdaptivePl_ReadActive(u32 baseAddress, AdaptivePlParameters *parameters,
+		u32 *appliedSequence, u32 *applyStatus, u32 maximumAttempts);
 int AdaptivePl_Commit(u32 baseAddress, const AdaptivePlParameters *parameters,
 		u32 commitSequence, u32 maximumPolls);
 int AdaptivePl_ReadSnapshot(u32 baseAddress, AdaptivePlSnapshot *snapshot,
