@@ -25,19 +25,47 @@
 
 ## 3. 阶段 5A 数据接口合同
 
-参数接口 `0x0060 = 0xAD030001` 和已有 `0x0120～0x0135` 保持兼容。新增独立指标能力标识 `0x0136 = 0xAD050001`；旧 bitstream 在该未分配地址返回零。新 HAL 探测后读取，禁止将“不支持”解释为测量值零。
+参数接口 `0x0060 = 0xAD030001` 和已有快照寄存器保持兼容。两条回路使用相同的 word 地址，叠加不同基地址：
 
-| Word 地址 | 字段 | 类型/定义 |
-|---|---|---|
-| 0x0136 | METRICS_INFO | 指标扩展版本，不属于随窗口改变的数据 |
-| 0x0137～0x0138 | FREQ_SIGNED_SUM | s64，Σ e_f |
-| 0x0139～0x013A | FREQ_SQUARE_SUM | u64，Σ e_f²；包括 -8192 的精确平方 |
-| 0x013B～0x013C | PHASE_SIGNED_SUM | s64，Σ e_phi |
-| 0x013D | PHASE_FIRST | s32，窗口首样本 |
-| 0x013E | PHASE_LAST | s32，窗口末样本 |
-| 0x013F | RESIDUAL_BAD_UNION | u32，frequency_bad OR phase_bad 的样本数 |
-| 0x0140 | RAIL_UNION | u32，positive OR negative rail 的样本数 |
-| 0x0141 | PHASE_SAT_SAMPLES | u32，相位等于 INT32_MIN/MAX 的样本数 |
+- 测频回路：`0x40200000`
+- 锁相回路：`0x40600000`
+
+PS 字节地址计算为 `base + 4 × word_address`，多字寄存器按低 word、再高 word 读取，小端拼接。一次快照读取由 `0x0120` 开始，读取到 `0x0141` 结束；其中 `0x0135`、`0x0136` 不是窗口样本统计量，详见“范围/说明”列。
+
+| Word 地址 | 寄存器 | 类型 | 范围/说明 |
+|---|---|---|---|
+| `0x0120` | `SNAPSHOT_SEQ` | u32 | 窗口序号；每完成一个窗口加 1，复位初值为 0 |
+| `0x0121` | `SAMPLE_COUNT` | u32 | 本冻结快照包含的采样数；测频为 `2^17`，锁相为 `2^12` |
+| `0x0122～0x0123` | `AMP_SUM` | u64 | 窗口幅值累加和 |
+| `0x0124` | `AMP_MIN_MAX` | u16 + u16 | 低 16 bit 为幅值最小值，高 16 bit 为幅值最大值 |
+| `0x0125～0x0126` | `FREQ_ABS_SUM` | u64 | 窗口频率残差绝对值累加和 |
+| `0x0127` | `FREQ_ABS_MAX` | u32 | 窗口频率残差绝对值峰值 |
+| `0x0128～0x0129` | `PHASE_ABS_SUM` | u64 | 窗口相位残差绝对值累加和 |
+| `0x012A` | `PHASE_ABS_MAX` | u32 | 窗口相位残差绝对值峰值 |
+| `0x012B` | `OUTPUT_MIN` | s32 | 窗口环路输出最小值 |
+| `0x012C` | `OUTPUT_MAX` | s32 | 窗口环路输出最大值 |
+| `0x012D` | `LOCKED_SAMPLES` | u32 | 窗口内锁定有效样本数 |
+| `0x012E` | `POS_RAIL_SAMPLES` | u32 | 窗口内正限幅样本数 |
+| `0x012F` | `NEG_RAIL_SAMPLES` | u32 | 窗口内负限幅样本数 |
+| `0x0130` | `FREQ_BAD_SAMPLES` | u32 | 窗口内频率残差越限样本数 |
+| `0x0131` | `PHASE_BAD_SAMPLES` | u32 | 窗口内相位残差越限样本数 |
+| `0x0132` | `LOSS_LOCK_EVENTS` | u32 | 复位以来失锁下降沿累计次数的窗口快照 |
+| `0x0133` | `POS_RAIL_EVENTS` | u32 | 复位以来正限幅上升沿累计次数的窗口快照 |
+| `0x0134` | `NEG_RAIL_EVENTS` | u32 | 复位以来负限幅上升沿累计次数的窗口快照 |
+| `0x0135` | `COMMIT_ERRORS` | u32 | 参数提交错误累计次数，不属于窗口统计 |
+| `0x0136` | `METRICS_INFO` | u32 | 指标扩展能力标识；当前为 `0xAD050001`，不随窗口变化 |
+| `0x0137～0x0138` | `FREQ_SIGNED_SUM` | s64 | `Σ e_f`，窗口频率残差有符号和 |
+| `0x0139～0x013A` | `FREQ_SQUARE_SUM` | u64 | `Σ e_f^2`，包括 `-8192` 的精确平方 |
+| `0x013B～0x013C` | `PHASE_SIGNED_SUM` | s64 | `Σ e_phi`，窗口相位残差有符号和 |
+| `0x013D` | `PHASE_FIRST` | s32 | 窗口首个相位残差样本 |
+| `0x013E` | `PHASE_LAST` | s32 | 窗口最后一个相位残差样本 |
+| `0x013F` | `RESIDUAL_BAD_UNION` | u32 | `frequency_bad OR phase_bad` 的窗口样本数 |
+| `0x0140` | `RAIL_UNION` | u32 | `positive_rail OR negative_rail` 的窗口样本数 |
+| `0x0141` | `PHASE_SAT_SAMPLES` | u32 | 相位残差等于 `INT32_MIN/MAX` 的窗口样本数 |
+
+旧 bitstream 在 `0x0136` 未实现时返回 0；PS 必须将其解释为“不支持扩展指标”，不能解释为测量值为零。
+
+`SNAPSHOT_SEQ` 当前为 32 位自然回卷计数器：`0xFFFFFFFF` 后回到 `0x00000000`。由于 0 同时用于表示“尚无有效快照”，PS HAL 不接受序号为 0 的快照；长期运行时应通过跳号检测并记录该边界事件。
 
 所有地址均为 word address，PS 字节地址 = base + 4 × word。原快照 672 bit，加上 352 bit 扩展后为 1024 bit；锁相 CDC 必须整体传递，不能为扩展字段另建不同步快照。
 
