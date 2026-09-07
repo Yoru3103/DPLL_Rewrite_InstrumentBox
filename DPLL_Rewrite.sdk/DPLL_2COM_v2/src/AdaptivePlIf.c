@@ -42,6 +42,15 @@
 #define REG_POS_RAIL_EVENTS      0x0133U
 #define REG_NEG_RAIL_EVENTS      0x0134U
 #define REG_COMMIT_ERRORS        0x0135U
+#define REG_METRICS_INFO         0x0136U
+#define REG_FREQ_SIGNED_LOW      0x0137U
+#define REG_FREQ_SQUARE_LOW      0x0139U
+#define REG_PHASE_SIGNED_LOW     0x013BU
+#define REG_PHASE_FIRST          0x013DU
+#define REG_PHASE_LAST           0x013EU
+#define REG_RESIDUAL_BAD_UNION    0x013FU
+#define REG_RAIL_UNION            0x0140U
+#define REG_PHASE_SAT_SAMPLES    0x0141U
 
 static u32 AdaptivePl_Read(u32 baseAddress, u32 wordAddress)
 {
@@ -159,12 +168,24 @@ int AdaptivePl_ReadSnapshot(u32 baseAddress, AdaptivePlSnapshot *snapshot,
 	u32 attempt;
 	u32 sequenceBefore;
 	u32 packedAmplitude;
+	u32 metricsInfo;
 
 	if ((snapshot == 0) || (maximumAttempts == 0U))
 		return ADAPTIVE_PL_INVALID_ARGUMENT;
+	snapshot->metricsInfo = 0U;
 	if (AdaptivePl_Probe(baseAddress) != ADAPTIVE_PL_OK)
 		return ADAPTIVE_PL_NOT_PRESENT;
 
+	metricsInfo = AdaptivePl_Read(baseAddress, REG_METRICS_INFO);
+	/* Reset optional fields even when the caller reuses a previous v1 snapshot. */
+	snapshot->frequencySignedSum = 0;
+	snapshot->frequencySquareSum = 0U;
+	snapshot->phaseSignedSum = 0;
+	snapshot->phaseFirst = 0;
+	snapshot->phaseLast = 0;
+	snapshot->residualBadSampleCount = 0U;
+	snapshot->railSampleCount = 0U;
+	snapshot->phaseSaturatedSampleCount = 0U;
 	for (attempt = 0U; attempt < maximumAttempts; ++attempt) {
 		sequenceBefore = AdaptivePl_Read(baseAddress, REG_SNAPSHOT_SEQ);
 		snapshot->sampleCount = AdaptivePl_Read(baseAddress, REG_SAMPLE_COUNT);
@@ -187,9 +208,21 @@ int AdaptivePl_ReadSnapshot(u32 baseAddress, AdaptivePlSnapshot *snapshot,
 		snapshot->positiveRailEventCount = AdaptivePl_Read(baseAddress, REG_POS_RAIL_EVENTS);
 		snapshot->negativeRailEventCount = AdaptivePl_Read(baseAddress, REG_NEG_RAIL_EVENTS);
 		snapshot->commitErrorCount = AdaptivePl_Read(baseAddress, REG_COMMIT_ERRORS);
+		if (metricsInfo == ADAPTIVE_PL_METRICS_INFO_VALUE) {
+			snapshot->frequencySignedSum = (s64)AdaptivePl_Read64(baseAddress, REG_FREQ_SIGNED_LOW);
+			snapshot->frequencySquareSum = AdaptivePl_Read64(baseAddress, REG_FREQ_SQUARE_LOW);
+			snapshot->phaseSignedSum = (s64)AdaptivePl_Read64(baseAddress, REG_PHASE_SIGNED_LOW);
+			snapshot->phaseFirst = (s32)AdaptivePl_Read(baseAddress, REG_PHASE_FIRST);
+			snapshot->phaseLast = (s32)AdaptivePl_Read(baseAddress, REG_PHASE_LAST);
+			snapshot->residualBadSampleCount = AdaptivePl_Read(baseAddress, REG_RESIDUAL_BAD_UNION);
+			snapshot->railSampleCount = AdaptivePl_Read(baseAddress, REG_RAIL_UNION);
+			snapshot->phaseSaturatedSampleCount = AdaptivePl_Read(baseAddress, REG_PHASE_SAT_SAMPLES);
+		}
 		snapshot->sequence = AdaptivePl_Read(baseAddress, REG_SNAPSHOT_SEQ);
-		if ((snapshot->sequence == sequenceBefore) && (snapshot->sequence != 0U))
+		if ((snapshot->sequence == sequenceBefore) && (snapshot->sequence != 0U)) {
+			snapshot->metricsInfo = (metricsInfo == ADAPTIVE_PL_METRICS_INFO_VALUE) ? metricsInfo : 0U;
 			return ADAPTIVE_PL_OK;
+		}
 	}
 
 	return ADAPTIVE_PL_INCONSISTENT_SNAPSHOT;

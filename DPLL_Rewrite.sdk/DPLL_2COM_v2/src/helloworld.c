@@ -652,6 +652,11 @@ static void Autotune_MergeSnapshot(AutotuneContext *ctx,
 	if(residualBadCount < snapshot->frequencyBadSampleCount ||
 		residualBadCount > snapshot->sampleCount)
 		residualBadCount = snapshot->sampleCount;
+	/* New PL counts the union at each sample; legacy snapshots retain the approximation. */
+	if(snapshot->metricsInfo == ADAPTIVE_PL_METRICS_INFO_VALUE) {
+		railCount = snapshot->railSampleCount;
+		residualBadCount = snapshot->residualBadSampleCount;
+	}
 
 	ctx->metrics.amplitudeSum += snapshot->amplitudeSum;
 	ctx->metrics.absFreqSum += snapshot->frequencyAbsSum;

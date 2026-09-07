@@ -112,6 +112,7 @@
 **/doc/
 **/example_design/
 **/demo_tb/
+Packages/
 
 # ============================================================
 # Archives and editor/OS files

@@ -3,11 +3,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import struct
+from decimal import Decimal, InvalidOperation
 
 
 REQUEST_HEAD = 0xC6
 RESPONSE_HEAD = 0xA2
 MAX_PAYLOAD = 48
+
+
+def center_mhz_to_word(text: str) -> int:
+    value = text.strip().lower()
+    if value.endswith("mhz"):
+        value = value[:-3].strip()
+    try:
+        frequency = Decimal(value)
+    except InvalidOperation:
+        raise ValueError("请输入 MHz 数值，例如 40、40.5 或 40MHz") from None
+    if not frequency.is_finite() or not Decimal(0) <= frequency < Decimal(125):
+        raise ValueError("中心频率必须满足 0 ≤ MHz < 125（125 MHz 时钟）")
+    word = round(frequency * (1 << 32) / Decimal(125))
+    if word > 0xFFFFFFFF:
+        raise ValueError("中心频率超过 32 位频率控制字可表示的上限")
+    return word
+
+
+def center_word_to_mhz(value: int) -> str:
+    return f"{Decimal(value) * 125 / (1 << 32):.9f}"
 
 
 class Command(IntEnum):
@@ -18,6 +39,10 @@ class Command(IntEnum):
     READ_FREQ_CENTER = 0x10
     READ_FREQ_PID = 0x13
     READ_FREQ_STATUS = 0x14
+    READ_FREQ_RUN_STATUS = 0x15
+    READ_FREQ_COUNT = 0x17
+    WRITE_FREQ_TIMER = 0x94
+    FREQ_TRIGGER = 0x95
     WRITE_DPLL_CENTER = 0x82
     WRITE_DPLL_PID = 0x86
     DPLL_ON = 0x8A
@@ -182,6 +207,16 @@ def pack_u32(value: int) -> bytes:
     if not 0 <= value <= 0xFFFFFFFF:
         raise ValueError("value must fit uint32")
     return struct.pack("<I", value)
+
+
+def unpack_frequency(payload: bytes) -> float:
+    if len(payload) != 16:
+        raise ProtocolError("测频结果长度应为 16 字节")
+    phase_sum = int.from_bytes(payload[:10], "little")
+    gate_clocks = int.from_bytes(payload[10:], "little")
+    if gate_clocks == 0:
+        raise ProtocolError("测频门控时间为零，请重新测量")
+    return phase_sum * 125_000_000 / (gate_clocks * (1 << 33))
 
 
 def unpack_u32(payload: bytes, offset: int = 0) -> int:

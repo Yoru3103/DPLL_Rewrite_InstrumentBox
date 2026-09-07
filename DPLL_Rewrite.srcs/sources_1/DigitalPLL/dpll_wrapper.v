@@ -847,8 +847,25 @@ wire [31:0] adaptive_output_min, adaptive_output_max;
 wire [31:0] adaptive_locked_samples, adaptive_pos_rail_samples, adaptive_neg_rail_samples;
 wire [31:0] adaptive_freq_bad_samples, adaptive_phase_bad_samples;
 wire [31:0] adaptive_loss_lock_events, adaptive_pos_rail_events, adaptive_neg_rail_events;
-// 672 bit bundled-data：源域保持整组数据稳定，目的域检测 toggle 后一次性锁存。
-wire [671:0] adaptive_snapshot_source_bundle, adaptive_snapshot_bus_bundle;
+// 1024 bit bundled-data：源域保持整组数据稳定，目的域检测 toggle 后一次性锁存。
+wire [1023:0] adaptive_snapshot_source_bundle, adaptive_snapshot_bus_bundle;
+
+wire [63:0] adaptive_freq_signed_sum;
+wire [63:0] adaptive_freq_square_sum;
+wire [63:0] adaptive_phase_signed_sum;
+wire [31:0] adaptive_phase_first;
+wire [31:0] adaptive_phase_last;
+wire [31:0] adaptive_residual_bad_samples;
+wire [31:0] adaptive_rail_samples;
+wire [31:0] adaptive_phase_sat_samples;
+wire [63:0] adaptive_freq_signed_sum_loop;
+wire [63:0] adaptive_freq_square_sum_loop;
+wire [63:0] adaptive_phase_signed_sum_loop;
+wire [31:0] adaptive_phase_first_loop;
+wire [31:0] adaptive_phase_last_loop;
+wire [31:0] adaptive_residual_bad_samples_loop;
+wire [31:0] adaptive_rail_samples_loop;
+wire [31:0] adaptive_phase_sat_samples_loop;
 
 adaptive_statistics #(.WINDOW_LOG2(12)) adaptive_loop_statistics (
     .clk(clk_dpll), .reset_n(rst), .amplitude(DDC_Amplitude_0),
@@ -871,7 +888,15 @@ adaptive_statistics #(.WINDOW_LOG2(12)) adaptive_loop_statistics (
     .phase_bad_sample_count(adaptive_phase_bad_samples_loop),
     .loss_of_lock_event_count(adaptive_loss_lock_events_loop),
     .positive_rail_event_count(adaptive_pos_rail_events_loop),
-    .negative_rail_event_count(adaptive_neg_rail_events_loop)
+    .negative_rail_event_count(adaptive_neg_rail_events_loop),
+    .frequency_signed_sum(adaptive_freq_signed_sum_loop),
+    .frequency_square_sum(adaptive_freq_square_sum_loop),
+    .phase_signed_sum(adaptive_phase_signed_sum_loop),
+    .phase_first(adaptive_phase_first_loop),
+    .phase_last(adaptive_phase_last_loop),
+    .residual_bad_sample_count(adaptive_residual_bad_samples_loop),
+    .rail_sample_count(adaptive_rail_samples_loop),
+    .phase_saturated_sample_count(adaptive_phase_sat_samples_loop)
 );
 
 assign adaptive_snapshot_source_bundle = {
@@ -882,11 +907,19 @@ assign adaptive_snapshot_source_bundle = {
     adaptive_pos_rail_samples_loop, adaptive_neg_rail_samples_loop,
     adaptive_freq_bad_samples_loop, adaptive_phase_bad_samples_loop,
     adaptive_loss_lock_events_loop, adaptive_pos_rail_events_loop,
-    adaptive_neg_rail_events_loop
+    adaptive_neg_rail_events_loop,
+    adaptive_freq_signed_sum_loop,
+    adaptive_freq_square_sum_loop,
+    adaptive_phase_signed_sum_loop,
+    adaptive_phase_first_loop,
+    adaptive_phase_last_loop,
+    adaptive_residual_bad_samples_loop,
+    adaptive_rail_samples_loop,
+    adaptive_phase_sat_samples_loop
 };
 
 // 只对 toggle 使用两级同步器；宽数据依靠快照保持时间完成 bundled-data CDC。
-adaptive_snapshot_cdc #(.DATA_WIDTH(672)) adaptive_statistics_cdc (
+adaptive_snapshot_cdc #(.DATA_WIDTH(1024)) adaptive_statistics_cdc (
     .dst_clk(clk1), .dst_reset_n(rst), .src_toggle(adaptive_snapshot_toggle_loop),
     .src_data(adaptive_snapshot_source_bundle), .dst_data(adaptive_snapshot_bus_bundle)
 );
@@ -898,7 +931,15 @@ assign {
     adaptive_output_min, adaptive_output_max, adaptive_locked_samples,
     adaptive_pos_rail_samples, adaptive_neg_rail_samples, adaptive_freq_bad_samples,
     adaptive_phase_bad_samples, adaptive_loss_lock_events, adaptive_pos_rail_events,
-    adaptive_neg_rail_events
+    adaptive_neg_rail_events,
+    adaptive_freq_signed_sum,
+    adaptive_freq_square_sum,
+    adaptive_phase_signed_sum,
+    adaptive_phase_first,
+    adaptive_phase_last,
+    adaptive_residual_bad_samples,
+    adaptive_rail_samples,
+    adaptive_phase_sat_samples
 } = adaptive_snapshot_bus_bundle;
 
 always @(posedge clk1)
@@ -988,6 +1029,18 @@ end else begin
         16'h0133 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_pos_rail_events;             end
         16'h0134 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_neg_rail_events;             end
         16'h0135 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_commit_error_count;          end
+        16'h0136 : begin sys_ack <= sys_en; sys_rdata <= 32'hAD050001; end
+        16'h0137 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_signed_sum[31:0]; end
+        16'h0138 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_signed_sum[63:32]; end
+        16'h0139 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_square_sum[31:0]; end
+        16'h013A : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_square_sum[63:32]; end
+        16'h013B : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_signed_sum[31:0]; end
+        16'h013C : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_signed_sum[63:32]; end
+        16'h013D : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_first; end
+        16'h013E : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_last; end
+        16'h013F : begin sys_ack <= sys_en; sys_rdata <= adaptive_residual_bad_samples; end
+        16'h0140 : begin sys_ack <= sys_en; sys_rdata <= adaptive_rail_samples; end
+        16'h0141 : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_sat_samples; end
         16'h01FF : begin sys_ack <= sys_en;          sys_rdata <= 32'h7FFFFFFF;                         end
 
         default  : begin sys_ack <= sys_en;          sys_rdata <=  32'h0;                               end

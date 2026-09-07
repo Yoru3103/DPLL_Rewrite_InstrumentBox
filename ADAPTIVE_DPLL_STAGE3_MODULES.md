@@ -1,3 +1,5 @@
+> 历史阶段记录：后续阶段 5A 扩展及当前状态见 [AUTOTUNE_IMPLEMENTATION_PLAN.md](AUTOTUNE_IMPLEMENTATION_PLAN.md)。下述“尚未接入”“保持不变”描述该历史阶段边界。
+
 # 阶段 3：PL 安全接口与未来规划
 
 > 本文档只说明模块目的、接口分区和后续接入方向。RTL 细节以源码注释和测试文件为准。

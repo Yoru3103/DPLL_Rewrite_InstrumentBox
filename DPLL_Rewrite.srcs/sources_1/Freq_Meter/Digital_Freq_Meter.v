@@ -653,6 +653,15 @@ wire [31:0] adaptive_locked_samples, adaptive_pos_rail_samples, adaptive_neg_rai
 wire [31:0] adaptive_freq_bad_samples, adaptive_phase_bad_samples;
 wire [31:0] adaptive_loss_lock_events, adaptive_pos_rail_events, adaptive_neg_rail_events;
 
+wire [63:0] adaptive_freq_signed_sum;
+wire [63:0] adaptive_freq_square_sum;
+wire [63:0] adaptive_phase_signed_sum;
+wire [31:0] adaptive_phase_first;
+wire [31:0] adaptive_phase_last;
+wire [31:0] adaptive_residual_bad_samples;
+wire [31:0] adaptive_rail_samples;
+wire [31:0] adaptive_phase_sat_samples;
+
 adaptive_statistics #(.WINDOW_LOG2(17)) adaptive_loop_statistics (
     .clk(clk1), .reset_n(rst), .amplitude(DDC_Amplitude_0),
     .frequency_error(inst_frequency0), .phase_error(phase_residuals0),
@@ -673,7 +682,15 @@ adaptive_statistics #(.WINDOW_LOG2(17)) adaptive_loop_statistics (
     .phase_bad_sample_count(adaptive_phase_bad_samples),
     .loss_of_lock_event_count(adaptive_loss_lock_events),
     .positive_rail_event_count(adaptive_pos_rail_events),
-    .negative_rail_event_count(adaptive_neg_rail_events)
+    .negative_rail_event_count(adaptive_neg_rail_events),
+    .frequency_signed_sum(adaptive_freq_signed_sum),
+    .frequency_square_sum(adaptive_freq_square_sum),
+    .phase_signed_sum(adaptive_phase_signed_sum),
+    .phase_first(adaptive_phase_first),
+    .phase_last(adaptive_phase_last),
+    .residual_bad_sample_count(adaptive_residual_bad_samples),
+    .rail_sample_count(adaptive_rail_samples),
+    .phase_saturated_sample_count(adaptive_phase_sat_samples)
 );
 
 always @(posedge clk1)
@@ -761,6 +778,18 @@ end else begin
         16'h0133 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_pos_rail_events;             end
         16'h0134 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_neg_rail_events;             end
         16'h0135 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_commit_error_count;          end
+        16'h0136 : begin sys_ack <= sys_en; sys_rdata <= 32'hAD050001; end
+        16'h0137 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_signed_sum[31:0]; end
+        16'h0138 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_signed_sum[63:32]; end
+        16'h0139 : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_square_sum[31:0]; end
+        16'h013A : begin sys_ack <= sys_en; sys_rdata <= adaptive_freq_square_sum[63:32]; end
+        16'h013B : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_signed_sum[31:0]; end
+        16'h013C : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_signed_sum[63:32]; end
+        16'h013D : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_first; end
+        16'h013E : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_last; end
+        16'h013F : begin sys_ack <= sys_en; sys_rdata <= adaptive_residual_bad_samples; end
+        16'h0140 : begin sys_ack <= sys_en; sys_rdata <= adaptive_rail_samples; end
+        16'h0141 : begin sys_ack <= sys_en; sys_rdata <= adaptive_phase_sat_samples; end
 
 //        16'h0115 : begin sys_ack <= sys_en;          sys_rdata <= phase_addr_o1[31:0];                 end 
 //        16'h0116 : begin sys_ack <= sys_en;          sys_rdata <= phase_addr_o1[63:32];                end 

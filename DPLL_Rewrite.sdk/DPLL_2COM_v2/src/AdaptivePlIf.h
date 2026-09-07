@@ -4,6 +4,7 @@
 #include "xil_types.h"
 
 #define ADAPTIVE_PL_IF_INFO_VALUE       0xAD030001U
+#define ADAPTIVE_PL_METRICS_INFO_VALUE  0xAD050001U
 #define ADAPTIVE_PL_STATUS_BUSY         (1U << 0)
 #define ADAPTIVE_PL_STATUS_ACTIVE       (1U << 1)
 #define ADAPTIVE_PL_STATUS_ERROR        (1U << 2)
@@ -38,6 +39,16 @@ typedef struct {
 	u32 positiveRailEventCount;
 	u32 negativeRailEventCount;
 	u32 commitErrorCount;
+	/* Zero metricsInfo means extension unavailable, never a zero-error observation. */
+	u32 metricsInfo;
+	s64 frequencySignedSum;
+	u64 frequencySquareSum;
+	s64 phaseSignedSum;
+	s32 phaseFirst;
+	s32 phaseLast;
+	u32 residualBadSampleCount;
+	u32 railSampleCount;
+	u32 phaseSaturatedSampleCount;
 } AdaptivePlSnapshot;
 
 typedef enum {

@@ -37,7 +37,16 @@ module adaptive_statistics #(
     output reg  [31:0]             phase_bad_sample_count,     // 窗口内相位越限样本数
     output reg  [31:0]             loss_of_lock_event_count,   // 复位以来累计失锁边沿数的快照
     output reg  [31:0]             positive_rail_event_count,  // 复位以来累计正限幅边沿数的快照
-    output reg  [31:0]             negative_rail_event_count   // 复位以来累计负限幅边沿数的快照
+    output reg  [31:0]             negative_rail_event_count,  // 复位以来累计负限幅边沿数的快照
+    // Metrics extension v1. Exact signed moments; legacy absolute fields stay unchanged.
+    output reg signed [63:0]       frequency_signed_sum,
+    output reg [63:0]              frequency_square_sum,
+    output reg signed [63:0]       phase_signed_sum,
+    output reg signed [31:0]       phase_first,
+    output reg signed [31:0]       phase_last,
+    output reg [31:0]              residual_bad_sample_count,
+    output reg [31:0]              rail_sample_count,
+    output reg [31:0]              phase_saturated_sample_count
 );
 
 // 固定窗口包含的采样点数；使用 2 的整数次幂可将边界判断简化为全 1 检测。
@@ -56,6 +65,18 @@ reg [31:0] freq_bad_work, phase_bad_work; // 当前窗口残差越限样本计�
 reg previous_locked, previous_pos_rail, previous_neg_rail; // 上一拍状态，用于边沿检测
 reg snapshot_toggle_r;              // 完整窗口到达指示，供 CDC 模块同步
 reg [31:0] loss_event_total, pos_event_total, neg_event_total; // 复位以来的饱和事件总数
+
+// Supported window range: 1..31; all moments fit in 64 bits even at the endpoints.
+reg signed [63:0] freq_signed_work, phase_signed_work;
+reg [63:0] freq_square_work;
+reg signed [31:0] phase_first_work;
+reg [31:0] residual_bad_work, rail_work, phase_saturated_work;
+wire signed [63:0] frequency_extended = {{50{frequency_error[13]}}, frequency_error};
+wire signed [63:0] phase_extended = {{32{phase_error[31]}}, phase_error};
+wire signed [27:0] frequency_square = frequency_error * frequency_error;
+wire residual_bad = frequency_bad | phase_bad;
+wire rail = rail_positive | rail_negative;
+wire phase_saturated = (phase_error == 32'sh80000000) || (phase_error == 32'sh7fffffff);
 
 // 对二补码最小负数取绝对值会溢出，因此在最大正数处饱和。
 wire [13:0] frequency_abs =
@@ -99,6 +120,21 @@ always @(posedge clk) begin
         loss_event_total <= 32'd0;
         pos_event_total <= 32'd0;
         neg_event_total <= 32'd0;
+        freq_signed_work <= 64'sd0;
+        freq_square_work <= 64'd0;
+        phase_signed_work <= 64'sd0;
+        phase_first_work <= 32'sd0;
+        residual_bad_work <= 32'd0;
+        rail_work <= 32'd0;
+        phase_saturated_work <= 32'd0;
+        frequency_signed_sum <= 64'sd0;
+        frequency_square_sum <= 64'd0;
+        phase_signed_sum <= 64'sd0;
+        phase_first <= 32'sd0;
+        phase_last <= 32'sd0;
+        residual_bad_sample_count <= 32'd0;
+        rail_sample_count <= 32'd0;
+        phase_saturated_sample_count <= 32'd0;
         snapshot_seq <= 32'd0;
         snapshot_toggle_r <= 1'b0;
         sample_count <= 32'd0;
@@ -136,6 +172,14 @@ always @(posedge clk) begin
             snapshot_seq <= snapshot_seq + 32'd1;
             snapshot_toggle_r <= ~snapshot_toggle_r;
             sample_count <= WINDOW_SAMPLES;
+            frequency_signed_sum <= freq_signed_work + frequency_extended;
+            frequency_square_sum <= freq_square_work + {36'd0, frequency_square};
+            phase_signed_sum <= phase_signed_work + phase_extended;
+            phase_first <= phase_first_work;
+            phase_last <= phase_error;
+            residual_bad_sample_count <= residual_bad_work + residual_bad;
+            rail_sample_count <= rail_work + rail;
+            phase_saturated_sample_count <= phase_saturated_work + phase_saturated;
             amplitude_sum <= amp_sum_work + amplitude;
             amplitude_min <= (amplitude < amp_min_work) ? amplitude : amp_min_work;
             amplitude_max <= (amplitude > amp_max_work) ? amplitude : amp_max_work;
@@ -159,6 +203,12 @@ always @(posedge clk) begin
 
             // 快照完成后清空工作区，下一拍开始统计新窗口。
             window_index <= {WINDOW_LOG2{1'b0}};
+            freq_signed_work <= 64'sd0;
+            freq_square_work <= 64'd0;
+            phase_signed_work <= 64'sd0;
+            residual_bad_work <= 32'd0;
+            rail_work <= 32'd0;
+            phase_saturated_work <= 32'd0;
             amp_sum_work <= 64'd0;
             amp_min_work <= 16'hffff;
             amp_max_work <= 16'd0;
@@ -176,6 +226,13 @@ always @(posedge clk) begin
         end else begin
             // 普通采样拍：只更新当前窗口工作寄存器，不改变对外快照。
             window_index <= window_index + {{(WINDOW_LOG2-1){1'b0}}, 1'b1};
+            if (window_index == 0) phase_first_work <= phase_error;
+            freq_signed_work <= freq_signed_work + frequency_extended;
+            freq_square_work <= freq_square_work + {36'd0, frequency_square};
+            phase_signed_work <= phase_signed_work + phase_extended;
+            residual_bad_work <= residual_bad_work + residual_bad;
+            rail_work <= rail_work + rail;
+            phase_saturated_work <= phase_saturated_work + phase_saturated;
             amp_sum_work <= amp_sum_work + amplitude;
             if (amplitude < amp_min_work) amp_min_work <= amplitude;
             if (amplitude > amp_max_work) amp_max_work <= amplitude;

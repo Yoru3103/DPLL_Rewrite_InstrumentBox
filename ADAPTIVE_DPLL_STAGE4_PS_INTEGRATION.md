@@ -1,3 +1,5 @@
+> 历史阶段记录：后续阶段 5A 扩展及当前状态见 [AUTOTUNE_IMPLEMENTATION_PLAN.md](AUTOTUNE_IMPLEMENTATION_PLAN.md)。下述“尚未接入”“保持不变”描述该历史阶段边界。
+
 <!--
  * @Author: WZX
  * @Date: 2026-08-29 23:47:34

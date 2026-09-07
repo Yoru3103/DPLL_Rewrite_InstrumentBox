@@ -19,9 +19,11 @@ from serial.tools import list_ports
 from .protocol import (
     AutotuneAction, AutotunePolicy, AutotuneStatus, Command, LoopTarget,
     ProtocolError, pack_autotune, pack_pid, pack_u32, profile_name, unpack_ack,
-    unpack_autotune, unpack_pid, unpack_u32,
+    unpack_autotune, unpack_pid, unpack_u32, unpack_frequency,
+    center_mhz_to_word, center_word_to_mhz,
 )
 from .transport import SerialWorker
+from .stability_page import StabilityPage
 from .validation import (
     RunRecord, ValidationCase, ValidationLogger, default_plan_text, parse_int,
     parse_plan, timestamp_now,
@@ -103,7 +105,8 @@ class LoopManualCard(QGroupBox):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.center = QLineEdit("0")
-        self.center.setPlaceholderText("十进制或 0x 十六进制寄存器值")
+        self.center.setPlaceholderText("例如 40 或 40MHz")
+        self.center.setToolTip("单位 MHz；按 125 MHz 时钟换算为 32 位频率控制字")
         center_buttons = QHBoxLayout()
         read_center = QPushButton("读取中心频率")
         write_center = QPushButton("写入中心频率")
@@ -114,7 +117,7 @@ class LoopManualCard(QGroupBox):
         center_row_layout.setContentsMargins(0, 0, 0, 0)
         center_row_layout.addWidget(self.center)
         center_row_layout.addLayout(center_buttons)
-        form.addRow("中心频率寄存器", center_row)
+        form.addRow("中心频率（MHz）", center_row)
 
         self.pid_fields: dict[str, QLineEdit] = {}
         for name in ("Kp", "Ki", "Kii", "Kd"):
@@ -146,6 +149,20 @@ class LoopManualCard(QGroupBox):
         control_buttons.addStretch()
         layout.addLayout(control_buttons)
 
+        if target is LoopTarget.FREQ:
+            self.frequency = QLabel("— Hz")
+            self.frequency.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            read_frequency = QPushButton("读取实时频率（约 1 秒）")
+            read_frequency.setToolTip("设置 1 秒测量门宽并触发测频；按 125 MHz 时钟换算")
+            layout.addWidget(QLabel("实时频率（测频回路，门宽平均值）"))
+            layout.addWidget(self.frequency)
+            layout.addWidget(read_frequency)
+            self.frequency_deadline = 0.0
+            self.frequency_timer = QTimer(self)
+            self.frequency_timer.setSingleShot(True)
+            self.frequency_timer.timeout.connect(self._poll_frequency)
+            read_frequency.clicked.connect(self._read_frequency)
+
         read_center.clicked.connect(self._read_center)
         write_center.clicked.connect(self._write_center)
         read_pid.clicked.connect(self._read_pid)
@@ -160,9 +177,28 @@ class LoopManualCard(QGroupBox):
         read_center, _, _, _ = self._commands()
         self.request.emit(f"manual:{self.target.name.lower()}:read_center", read_center, b"")
 
+    def _read_frequency(self) -> None:
+        if time.monotonic() < self.frequency_deadline:
+            return
+        self.frequency_deadline = time.monotonic() + 5.0
+        self.frequency.setText("测量中…")
+        self.request.emit("manual:freq:frequency_timer", Command.WRITE_FREQ_TIMER,
+                          (125_000_000).to_bytes(6, "little"))
+
+    def _poll_frequency(self) -> None:
+        if time.monotonic() >= self.frequency_deadline:
+            self.frequency.setText("测量超时，请重试")
+            return
+        self.request.emit("manual:freq:frequency_busy", Command.READ_FREQ_RUN_STATUS, b"")
+
+    def frequency_failed(self, message: str) -> None:
+        self.frequency_timer.stop()
+        self.frequency_deadline = 0.0
+        self.frequency.setText(f"读取失败：{message}")
+
     def _write_center(self) -> None:
         try:
-            payload = pack_u32(parse_u32(self.center.text()))
+            payload = pack_u32(center_mhz_to_word(self.center.text()))
         except ValueError as exc:
             QMessageBox.warning(self, "输入错误", str(exc))
             return
@@ -184,9 +220,25 @@ class LoopManualCard(QGroupBox):
         self.request.emit(f"manual:{self.target.name.lower()}:write_pid", write_pid, payload)
 
     def handle_response(self, operation: str, payload: bytes) -> None:
-        if operation == "read_center":
+        if operation == "frequency_timer":
+            unpack_ack(payload)
+            self.request.emit("manual:freq:frequency_trigger", Command.FREQ_TRIGGER, b"")
+        elif operation == "frequency_trigger":
+            unpack_ack(payload)
+            self.frequency_timer.start(1100)
+        elif operation == "frequency_busy":
+            if len(payload) != 1 or payload[0] not in (0, 1):
+                raise ProtocolError("测频运行状态响应无效")
+            if payload[0]:
+                self.frequency_timer.start(100)
+            else:
+                self.request.emit("manual:freq:frequency_result", Command.READ_FREQ_COUNT, b"")
+        elif operation == "frequency_result":
+            self.frequency.setText(f"{unpack_frequency(payload):.6f} Hz")
+            self.frequency_deadline = 0.0
+        elif operation == "read_center":
             value = unpack_u32(payload)
-            self.center.setText(f"0x{value:08X}")
+            self.center.setText(center_word_to_mhz(value))
         elif operation == "read_pid":
             values = unpack_pid(payload)
             for name, value in zip(("Kp", "Ki", "Kii", "Kd"), values):
@@ -448,12 +500,14 @@ class MainWindow(QMainWindow):
         self.manual = ManualPage()
         self.autotune = AutotunePage()
         self.validation = ValidationPage()
+        self.stability = StabilityPage()
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
         self.tabs.addTab(self.manual, "手动控制")
         self.tabs.addTab(self.autotune, "Autotune")
         self.tabs.addTab(self.validation, "批次验证")
+        self.tabs.addTab(self.stability, "固定 PID 稳定度")
         self.tabs.addTab(self.log, "通信日志")
         root_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(root)
@@ -464,6 +518,9 @@ class MainWindow(QMainWindow):
         self.autotune.request.connect(self.send_request)
         self.validation.start_requested.connect(self.start_validation)
         self.validation.stop_requested.connect(self.stop_validation)
+        self.stability.request.connect(self.send_request)
+        self.stability.start_requested.connect(self.start_stability)
+        self.stability.running_changed.connect(self._stability_running)
         self.validation_timer = QTimer(self)
         self.validation_timer.setInterval(250)
         self.validation_timer.timeout.connect(self._validation_tick)
@@ -503,6 +560,9 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def disconnect_serial(self) -> None:
+        if self.stability.active:
+            QMessageBox.warning(self, "测试运行中", "请先停止稳定度测试，等待恢复原参数后再断开。")
+            return
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
@@ -511,6 +571,8 @@ class MainWindow(QMainWindow):
         self.connection.set_connected(False, "未连接")
 
     def _connection_changed(self, connected: bool, message: str) -> None:
+        if not connected:
+            self.stability.disconnected()
         self.connection.connect_button.setEnabled(True)
         self.connection.set_connected(connected, message)
         self.append_log(message)
@@ -520,12 +582,17 @@ class MainWindow(QMainWindow):
             self._finish_validation_batch()
 
     def _worker_finished(self) -> None:
+        self.stability.disconnected()
         self.worker = None
         self.pending.clear()
         self.connection.set_connected(False, "未连接")
 
     def send_request(self, tag: str, command: int, payload: bytes) -> None:
+        if self.stability.active and not tag.startswith("stability:"):
+            return
         if not self.worker or not self.worker.isRunning():
+            if tag.startswith("manual:freq:frequency_"):
+                self.manual.freq.frequency_failed("串口未连接")
             if not tag.endswith(":poll"):
                 self.append_log("请求被忽略：串口未连接")
             return
@@ -539,7 +606,9 @@ class MainWindow(QMainWindow):
         self.pending.discard(tag)
         self.append_log(f"RX {tag} cmd=0x{command:02X} payload={payload.hex(' ')}")
         try:
-            if tag.startswith("manual:"):
+            if tag.startswith("stability:"):
+                self.stability.response(tag, payload)
+            elif tag.startswith("manual:"):
                 self.manual.handle_response(tag, payload)
             elif tag.startswith("autotune:"):
                 self.autotune.handle_response(tag, payload)
@@ -554,12 +623,18 @@ class MainWindow(QMainWindow):
 
     def _request_failed(self, tag: str, message: str) -> None:
         self.pending.discard(tag)
+        if tag.startswith("stability:"):
+            self.stability.failed(tag, message)
+        if tag.startswith("manual:freq:frequency_"):
+            self.manual.freq.frequency_failed(message)
         self.append_log(f"ERROR {tag}: {message}")
         self.statusBar().showMessage(f"{tag}: {message}", 5000)
         if tag.startswith("validation:"):
             self._finish_validation_trial("ERROR", message)
 
     def start_validation(self, plan_text: str, output_dir: str) -> None:
+        if self.stability.active:
+            return
         if not self.worker or not self.worker.isRunning():
             QMessageBox.warning(self, "验证", "请先连接串口")
             return
@@ -697,9 +772,40 @@ class MainWindow(QMainWindow):
         self.append_log("批次验证结束")
 
     def closeEvent(self, event) -> None:
+        if self.stability.active:
+            self.stability.stop()
+            QMessageBox.information(self, "正在停止", "请等待原参数恢复后再次关闭窗口。")
+            event.ignore()
+            return
         self.stop_validation()
         self.disconnect_serial()
         super().closeEvent(event)
+
+    def start_stability(self) -> None:
+        if not self.worker or not self.worker.isRunning():
+            QMessageBox.warning(self, "稳定度测试", "请先连接串口。")
+            return
+        if self.validation_logger or self.pending or time.monotonic() < self.manual.freq.frequency_deadline:
+            QMessageBox.warning(self, "稳定度测试", "请停止批次验证，等待其他请求/测量结束后重试。")
+            return
+        # Stop background requests before the confirmation dialog's nested event loop.
+        previous_poll = self.autotune.auto_poll.isChecked()
+        self.autotune.auto_poll.setChecked(False)
+        self.stability.start()
+        if self.stability.active:
+            self._saved_auto_poll = previous_poll
+        else:
+            self.autotune.auto_poll.setChecked(previous_poll)
+
+    def _stability_running(self, running: bool) -> None:
+        if running:
+            self._saved_auto_poll = self.autotune.auto_poll.isChecked()
+            self.autotune.auto_poll.setChecked(False)
+        else:
+            self.autotune.auto_poll.setChecked(getattr(self, "_saved_auto_poll", True))
+        self.manual.setEnabled(not running)
+        self.autotune.setEnabled(not running)
+        self.validation.setEnabled(not running)
 
 
 def run() -> int:
