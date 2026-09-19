@@ -195,7 +195,8 @@ red_pitaya_ps i_ps (
   .sys_err_i     (ps_sys_err  ),  // system error indicator
   .sys_ack_i     (ps_sys_ack  ),  // system acknowledge signal
   // AXI masters
-  .axi0_clk_i(adc_clk_in),
+  // GP0 and its register-bus slaves share the same buffered 125 MHz clock.
+  .axi0_clk_i(adc_clk),
 //  .axi1_clk_i    (axi1_clk    ),  .axi0_clk_i    (axi0_clk    ),  // global clock
 //  .axi1_rstn_i   (axi1_rstn   ),  .axi0_rstn_i   (axi0_rstn   ),  // global reset
 //  .axi1_waddr_i  (axi1_waddr  ),  .axi0_waddr_i  (axi0_waddr  ),  // system write address

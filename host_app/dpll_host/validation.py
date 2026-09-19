@@ -18,7 +18,7 @@ DEFAULT_PLAN = [
         "center_frequency": None,
         "pid": None,
         "autotune": True,
-        "timeout_s": 20,
+        "timeout_s": 150,
         "note": "保持当前输入条件，重复验证测频候选选择的一致性"
     },
     {
@@ -28,7 +28,7 @@ DEFAULT_PLAN = [
         "center_frequency": None,
         "pid": None,
         "autotune": True,
-        "timeout_s": 25,
+        "timeout_s": 150,
         "note": "保持当前输入条件，重复验证锁相候选选择的一致性"
     }
 ]
@@ -42,7 +42,7 @@ class ValidationCase:
     center_frequency: int | None = None
     pid: tuple[int, int, int, int] | None = None
     autotune: bool = True
-    timeout_s: float = 20.0
+    timeout_s: float = 150.0
     note: str = ""
 
     @staticmethod
@@ -66,7 +66,7 @@ class ValidationCase:
             center_frequency=center,
             pid=pid,
             autotune=bool(data.get("autotune", True)),
-            timeout_s=float(data.get("timeout_s", 20.0)),
+            timeout_s=float(data.get("timeout_s", 150.0)),
             note=str(data.get("note", "")),
         )
 

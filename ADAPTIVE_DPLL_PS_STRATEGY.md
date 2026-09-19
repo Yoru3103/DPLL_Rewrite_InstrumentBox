@@ -1,12 +1,12 @@
 # DPLL 自适应调参执行方案
 
-> 文档状态：执行稿 v0.8
+> 文档状态：当前实现 v2
 >
 > PS 基线：`DPLL_2COM_v2`
 >
 > FPGA 工程：Vivado 2018.3
 >
-> 更新日期：2026-09-07
+> 更新日期：2026-09-20；评分与实施合同见 [AUTOTUNE_COMPLETE_DESIGN.md](AUTOTUNE_COMPLETE_DESIGN.md)
 
 ## 1. 项目目标
 
@@ -87,7 +87,7 @@ UART 处理必须保持非阻塞。自调状态机由主循环周期推进，不
 | 3 | `LEN` | `LEN` | payload 字节数 |
 | 4～ | `PAYLOAD` | `PAYLOAD` | 命令参数或返回数据 |
 
-所有多字节整数均使用小端序。PS 当前接收缓冲检查要求完整请求帧不超过 48 字节，因此上位机发送 payload 应限制在 44 字节以内；现有命令最大 payload 为 16 字节。
+所有多字节整数均使用小端序。PS 当前接收缓冲检查要求完整请求帧不超过 48 字节，因此上位机发送 payload 应限制在 44 字节以内；现有命令最大请求payload为21字节（action7），最大响应payload为44字节（action5）。
 
 请求校验计算式：
 
@@ -132,23 +132,23 @@ CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
 | `0x03 CLEAR` | `03` | 空闲时清除 DONE/FAILED 和历史结果 |
 | `0x04 SET_POLICY` | `04 policy` | 设置策略：`0=HOST_ONLY`、`1=BOOT_ONCE`、`2=BOOT_AND_RECOVER` |
 
-当前正式使用策略仍为 `HOST_ONLY`。`BOOT_ONCE` 和 `BOOT_AND_RECOVER` 只保留协议入口，需完成后续验证后启用。
+当前正式使用策略仍为 `HOST_ONLY`。`BOOT_ONCE` 和 `BOOT_AND_RECOVER` 尚未实现，设置时明确返回INVALID_POLICY。
 
 ### 4.4 自调响应 payload
 
-`0x97/0x98` 固定返回 18 字节 payload：
+`0x97/0x98` action0～4/7 返回18字节状态；action5返回44字节诊断，action6返回24字节配置；格式/页号等错误返回18字节状态。主状态如下：
 
 | payload 偏移 | 长度 | 字段 | 说明 |
 |---:|---:|---|---|
-| 0 | 1 | `protocol_version` | 当前为 1 |
+| 0 | 1 | `protocol_version` | 当前为 2 |
 | 1 | 1 | `action` | 本次响应对应的 action |
 | 2 | 4 | `status_word` | 状态位，小端序 |
 | 6 | 1 | `progress` | 进度 0～100 |
 | 7 | 1 | `current_profile` | 当前正在评价的 profile ID |
 | 8 | 1 | `active_profile` | 当前硬件生效的 profile ID |
 | 9 | 1 | `best_profile` | 当前最佳 profile ID |
-| 10 | 2 | `current_score` | 当前评分，饱和到 `0xFFFF` |
-| 12 | 2 | `best_score` | 最佳评分，饱和到 `0xFFFF` |
+| 10 | 2 | `current_score` | 当前评分J×1000，饱和到 `0xFFFF` |
+| 12 | 2 | `best_score` | 最佳组均分J×1000，饱和到 `0xFFFF` |
 | 14 | 4 | `elapsed_ms` | 本次任务运行时间，小端序 |
 
 `status_word` 定义：
@@ -160,9 +160,9 @@ CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
 | 2 | `FAILED`，任务失败 |
 | 3 | `PARAMS_VALID`，当前参数已通过验证 |
 | 4 | `LOCK_VALID`，当前锁定状态有效 |
-| 5 | `RETUNE_PENDING`，存在重调申请 |
-| 6 | 已启用失锁恢复策略 |
-| 7 | 已启用非 HOST_ONLY 自动策略 |
+| 5 | 保留的`RETUNE_PENDING`，当前恒0 |
+| 6 | 保留的失锁恢复策略位，当前恒0 |
+| 7 | 保留的非HOST_ONLY策略位，当前恒0 |
 | 8～11 | 执行状态 `execState` |
 | 12～15 | 健康状态 `healthState` |
 | 16～23 | 结果码 `result` |
@@ -174,8 +174,10 @@ CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
 |---|---|
 | `execState` | `0 IDLE`、`1 PRECHECK`、`2 BASELINE`、`3 APPLY_CANDIDATE`、`4 SETTLE`、`5 EVALUATE`、`6 NEXT_CANDIDATE`、`7 SELECT_BEST`、`8 APPLY_BEST`、`9 VERIFY`、`10 ROLLBACK`、`11 DONE`、`12 FAILED`、`13 CANCELED` |
 | `healthState` | `0 UNINITIALIZED`、`1 VALID`、`2 DEGRADED`、`3 LOST`、`4 RETUNE_PENDING`、`5 FAULT` |
-| `result` | `0 NONE`、`1 SUCCESS`、`2 ACCEPTED`、`3 BUSY`、`4 REJECTED`、`5 INVALID_ACTION`、`6 INVALID_POLICY`、`7 NOT_LOCKED`、`8 READBACK_ERROR`、`9 CANCELED` |
+| `result` | `0 NONE`、`1 SUCCESS`、`2 ACCEPTED`、`3 BUSY`、`4 REJECTED`、`5 INVALID_ACTION`、`6 INVALID_POLICY`、`7 NOT_LOCKED`、`8 READBACK_ERROR`、`9 CANCELED`、`10 UNSUPPORTED`、`11 DATA_ERROR`、`12 NO_IMPROVEMENT`、`13 INPUT_CHANGED`、`14 VERIFY_FAILED`、`15 TIMEOUT`、`16 ROLLBACK_FAILED`、`17 BAD_CONFIG` |
 | `profile ID` | `0 ORIGINAL`、`1 SAFE`、`2 TRACK_WEAK`、`3 TRACK_MEDIUM`、`4 TRACK_STRONG`、`5 ACQUIRE`、`0xFF NONE` |
+
+新增action5 `[05 page]`查询0～8页冻结诊断；action6 `[06]`读取配置；action7 `[07]+5×u32LE`设置windowMs/repeats/coveragePermille/amplitudeFloor/improvementPermille。逐页字段见 [上位机说明](host_app/README.md)。
 
 上位机判断自调可用应同时检查 `DONE=1`、`PARAMS_VALID=1` 和 `LOCK_VALID=1`，不能只检查历史 DONE 位。
 
@@ -184,13 +186,13 @@ CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
 每条回路分别维护以下 profile：
 
 - `ORIGINAL`：任务开始时读取的原参数，用于基线和最终回退。
-- `SAFE`：低增益安全参数。
+- `SAFE`：历史低增益候选名，仍须按全部门限验证，不代表已保证安全。
 - `TRACK_WEAK`：弱信号窄带跟踪参数。
 - `TRACK_MEDIUM`：中等信号参数。
 - `TRACK_STRONG`：强信号参数。
 - `ACQUIRE`：用于捕获或较大频率变化，默认不参与普通扫描。
 
-当前阶段优先调整 Kp、Ki。Kii、Kd 和 D 滤波系数只有在单独完成稳定性验证后才开放自动调整。
+当前搜索Kp/Ki四组有界候选；Kii/Kd/D_COEF完整继承ORIGINAL。ACQUIRE只保留历史名称，不参与当前引擎。
 
 阶段 2 的候选数值保留在当前 PS 代码中，但本轮实测结果暂不作为最终参数标定结论。未来修改 profile 数值时仍需先更新文档。
 
@@ -198,22 +200,19 @@ CHECKSUM = (CMD + LEN + sum(PAYLOAD)) & 0xFF
 
 完整定义见 [PID_EVALUATION_RULES.md](PID_EVALUATION_RULES.md)，分阶段交付见 [AUTOTUNE_IMPLEMENTATION_PLAN.md](AUTOTUNE_IMPLEMENTATION_PLAN.md)。
 
-现行 PS 评分只使用平均绝对频率/相位残差及失锁、限幅、越限计数；幅值用于合格性。峰值、输出范围和事件字段不等于已经参与选参，重新锁定时间目前也不是独立评分项。
-
-阶段 5A 增加频率有符号和/平方和、相位有符号和/首末值、精确 OR 计数和相位饱和计数，提供 PS 计算基础。后续依次实现窗口覆盖与诊断、新评价/重复搜索、动态验收。RMS、相位趋势和翻转率尚不参与现行评分。
-
-目标规则分为数据有效性、输入可比性、安全合格性和性能比较；不把所有相关指标直接相加。相位残差是会饱和和清零的累加器，趋势解释需排除饱和与切换窗口。
+PS已使用频率RMS、残差均值/MAE/峰值、相位斜率、带死区翻转率、幅值、锁定/越限/限幅/饱和计数、输出范围和事件计数。所有指标分别用于评分、安全或数据有效性；均值/std等相关量用于解释，不重复加权。完整公式、工程默认阈值和归一化见完整合同。
 
 ## 7. PS 状态语义
 
 一次自调事务至少包含以下阶段：
 
 ```text
-IDLE → PRECHECK → BASELINE → APPLY → SETTLE
-     → EVALUATE → SELECT_BEST → VERIFY → DONE
+IDLE → PRECHECK → ORIGINAL校准 → 正式BASELINE
+     → 候选APPLY/SETTLE/EVALUATE → ORIGINAL控制复测（四组）
+     → APPLY_BEST/SETTLE/VERIFY → DONE
 ```
 
-异常路径统一进入：
+参数已修改后的终止故障或取消进入以下回退路径；未修改参数时直接结束。候选合格性失败先恢复ORIGINAL进行控制复测，符合条件后继续下一候选：
 
 ```text
 ROLLBACK → FAILED / CANCELED
@@ -223,9 +222,9 @@ ROLLBACK → FAILED / CANCELED
 
 - `BUSY`：任务正在执行。
 - `DONE`：本次任务已经正常结束。
-- `FAILED`：任务失败，参数已经回退或正在回退。
+- `FAILED`：任务已经失败结束；回退是否成功须看结果码，ROLLBACK_FAILED不可当作已恢复。
 - `RUN_ID`：区分不同任务，避免上位机把旧响应当成新结果。
-- `ADAPT_READY`：至少有一组参数完成最终验证。
+- `ADAPT_READY`：当前DONE、PARAMS_VALID、LOCK_VALID同时成立。
 - `LOCK_VALID`：当前仍满足锁定条件；它与历史 DONE 状态分开维护。
 
 ## 8. 安全和兼容要求
@@ -235,8 +234,8 @@ ROLLBACK → FAILED / CANCELED
 3. commit 只有在 ack 和 active 参数读回一致后才算成功。
 4. 上电默认继续使用 legacy 参数路径；首次原子提交成功后才进入 atomic mode。
 5. 再次写旧参数地址时退出 atomic mode，保持原有手动功能可用。
-6. 自动调参期间禁止其它命令修改目标回路的 PID、锁定开关和中心频率。
-7. 失去输入信号时保持安全输出，不在噪声上反复搜索参数。
+6. 自动调参期间禁止其它命令修改任一回路、共享输入和配置，并拒绝阻塞UART1/数据日志读命令。
+7. 失去输入信号时终止搜索，尝试恢复ORIGINAL并等待重新锁定；未新增强制安全输出值，恢复不成功须报ROLLBACK_FAILED。
 
 ## 9. 当前阶段状态
 
@@ -248,7 +247,7 @@ ROLLBACK → FAILED / CANCELED
 | 3 | PL 统计快照、原子提交、CDC 和 PS HAL | 已提交，完整工程实现与板上验收待执行 |
 | 4 | PS 状态机接入方案 C 接口 | 代码已完成，待 SDK 完整构建与上板验证 |
 | 5A | 扩展观测量、HAL 和指标计算 | 实施与验证见新计划 |
-| 5B/5C | PS 窗口诊断、新评价和重复选参 | 待实施 |
+| 5B/5C | PS 窗口诊断、新评价和重复选参 | 已实现并进行离线验证，见完整合同 |
 | 5D | 动态响应及完整工程/板上验收 | 待实施 |
 | 6 | Kii、Kd、温漂和更高级策略 | 未来扩展 |
 

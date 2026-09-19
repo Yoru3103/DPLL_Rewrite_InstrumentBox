@@ -169,6 +169,13 @@ wire        [14-1:0]       inst_frequency0;        // diff(phi)/(2*pi) * 2^14
 
 //wire select_phase_or_freq0;
 wire [3:0] angleSelect_0;
+// Keep the DDC output selector in the 3.125 MHz consumer clock domain.
+// The bus register remains the configuration/readback source.
+reg [3:0] angleSelect_loop;
+always @(posedge clk_dpll) begin
+    if (!rst) angleSelect_loop <= 4'd0;
+    else angleSelect_loop <= angleSelect_0;
+end
 
     wire [32-1:0]Centre_Freq;    
     reg  [47:0]reference_frequency0 ;
@@ -246,7 +253,7 @@ DDC_wideband_filters DDC0_inst (
     
     // Used for nulling the lock phase offset:
     .lock(pll0_lock),
-    .angleSelect(angleSelect_0),
+    .angleSelect(angleSelect_loop),
      
      // Output
     .amplitude(DDC_Amplitude_0), 
@@ -827,6 +834,23 @@ PLL_output_average#
 wire sys_en;
 assign sys_en = sys_wen | sys_ren;
 
+// Sample legacy live telemetry before the wide register-address read mux.
+// This adds one 125 MHz sample delay, without changing sys_ack/read timing.
+// Autotune's coherent window snapshot uses its separate existing CDC path.
+reg [15:0] legacy_amplitude_bus;
+reg [13:0] legacy_phase_bus, legacy_frequency_bus;
+reg [31:0] legacy_pid_bus, legacy_limited_bus;
+reg [31:0] legacy_residual_bus, legacy_average_bus;
+always @(posedge clk1) begin
+    legacy_amplitude_bus <= DDC_Amplitude_0;
+    legacy_phase_bus <= wrapped_phase0;
+    legacy_frequency_bus <= inst_frequency0;
+    legacy_pid_bus <= pll0_output;
+    legacy_limited_bus <= PID_OUT_With_Limit;
+    legacy_residual_bus <= phase_residuals0;
+    legacy_average_bus <= pll_output_average_value;
+end
+
 // 后缀 _loop：3.125 MHz 统计源域中的冻结快照；无后缀：已复制到 125 MHz 总线域的快照。
 wire adaptive_snapshot_toggle_loop; // 每完成一个 DPLL 统计窗口翻转一次
 wire [31:0] adaptive_snapshot_seq_loop, adaptive_snapshot_samples_loop;
@@ -999,14 +1023,14 @@ end else begin
         16'h0100 : begin sys_ack <= sys_en;          sys_rdata <= {{32-16{1'b0}}, 
                 LED_R0,LED_G0,pll0_locked_Instant,dac0_railed_positive,dac0_railed_negative,residuals0_are_above_threshold_freq,residuals0_are_above_threshold_phase,
                 2'b0,pll0_lock,pll0_locked_Stable,positive_railed_Stable,negative_railed_Stable,residuals0_threshold_freq_Stable,residuals0_threshold_phase_Stable};end
-        16'h0101 : begin sys_ack <= sys_en;          sys_rdata <= {{32-16{1'b0}}, DDC_Amplitude_0};     end
-        16'h0102 : begin sys_ack <= sys_en;          sys_rdata <= {{32-14{1'b0}}, wrapped_phase0};      end
-        16'h0103 : begin sys_ack <= sys_en;          sys_rdata <= {{32-14{1'b0}}, inst_frequency0};     end        
+        16'h0101 : begin sys_ack <= sys_en;          sys_rdata <= {{32-16{1'b0}}, legacy_amplitude_bus};     end
+        16'h0102 : begin sys_ack <= sys_en;          sys_rdata <= {{32-14{1'b0}}, legacy_phase_bus};      end
+        16'h0103 : begin sys_ack <= sys_en;          sys_rdata <= {{32-14{1'b0}}, legacy_frequency_bus};     end
         
-        16'h0104 : begin sys_ack <= sys_en;          sys_rdata <=  pll0_output;                         end
-        16'h0105 : begin sys_ack <= sys_en;          sys_rdata <=  PID_OUT_With_Limit;                  end
-        16'h0106 : begin sys_ack <= sys_en;          sys_rdata <=  phase_residuals0;                    end
-        16'h0107 : begin sys_ack <= sys_en;          sys_rdata <=  pll_output_average_value;            end
+        16'h0104 : begin sys_ack <= sys_en;          sys_rdata <=  legacy_pid_bus;                         end
+        16'h0105 : begin sys_ack <= sys_en;          sys_rdata <=  legacy_limited_bus;                  end
+        16'h0106 : begin sys_ack <= sys_en;          sys_rdata <=  legacy_residual_bus;                    end
+        16'h0107 : begin sys_ack <= sys_en;          sys_rdata <=  legacy_average_bus;            end
         16'h0120 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_snapshot_seq;                end
         16'h0121 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_snapshot_samples;            end
         16'h0122 : begin sys_ack <= sys_en;          sys_rdata <= adaptive_amp_sum[31:0];               end

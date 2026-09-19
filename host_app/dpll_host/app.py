@@ -22,6 +22,7 @@ from .protocol import (
     unpack_autotune, unpack_pid, unpack_u32, unpack_frequency,
     center_mhz_to_word, center_word_to_mhz,
 )
+from .autotune_panel import AutotuneDetail, AutotuneDiagnostics
 from .transport import SerialWorker
 from .stability_page import StabilityPage
 from .validation import (
@@ -277,7 +278,8 @@ class AutotuneCard(QGroupBox):
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
         self.policy = QComboBox()
-        self.policy.addItems(["HOST_ONLY", "BOOT_ONCE", "BOOT_AND_RECOVER"])
+        self.policy.addItems(["HOST_ONLY"])
+        self.policy.setToolTip("当前固件仅实现上位机显式触发；开机和恢复策略尚未实现")
         set_policy = QPushButton("设置策略")
         top.addWidget(QLabel("触发策略"))
         top.addWidget(self.policy)
@@ -320,8 +322,8 @@ class AutotuneCard(QGroupBox):
             "当前候选": f"{status.current_profile} / {profile_name(status.current_profile)}",
             "活动档位": f"{status.active_profile} / {profile_name(status.active_profile)}",
             "最佳档位": f"{status.best_profile} / {profile_name(status.best_profile)}",
-            "当前分数": str(status.current_score),
-            "最佳分数": str(status.best_score),
+            "当前分数": ("未就绪/饱和（见诊断）" if status.current_score == 65535 else f"{status.current_score / 1000:.3f}") if status.protocol_version == 2 else str(status.current_score),
+            "最佳分数": ("未就绪/饱和（见诊断）" if status.best_score == 65535 else f"{status.best_score / 1000:.3f}") if status.protocol_version == 2 else str(status.best_score),
             "耗时": f"{status.elapsed_ms} ms",
             "ADAPT_READY": "是" if status.adapt_ready else "否",
         }
@@ -334,6 +336,7 @@ class AutotuneCard(QGroupBox):
 
 class AutotunePage(QWidget):
     request = pyqtSignal(str, int, bytes)
+    log = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -349,7 +352,23 @@ class AutotunePage(QWidget):
         self.dpll = AutotuneCard(LoopTarget.DPLL)
         cards.addWidget(self.freq, 0, 0)
         cards.addWidget(self.dpll, 0, 1)
-        layout.addLayout(cards)
+        detail_tabs = QTabWidget()
+        overview = QWidget()
+        overview.setLayout(cards)
+        detail_tabs.addTab(overview, "控制与状态")
+        panels = {target: AutotuneDetail() for target in LoopTarget}
+        for target, panel in panels.items():
+            detail_tabs.addTab(panel, target_name(target) + "配置/指标")
+        layout.addWidget(detail_tabs, 1)
+        log_row = QHBoxLayout()
+        log_row.addWidget(QLabel("完整指标 JSONL 目录"))
+        self.output = QLineEdit(str(Path(__file__).resolve().parents[1] / "validation_logs"))
+        log_row.addWidget(self.output, 1)
+        layout.addLayout(log_row)
+        self.diagnostics = AutotuneDiagnostics(panels, self.output, self)
+        self.diagnostics.request.connect(self.request)
+        self.diagnostics.log.connect(self.log)
+        self.auto_poll.toggled.connect(lambda enabled: setattr(self.diagnostics, "background", enabled))
         self.freq.action_requested.connect(self._action)
         self.dpll.action_requested.connect(self._action)
         self.poll_timer = QTimer(self)
@@ -368,7 +387,7 @@ class AutotunePage(QWidget):
         )
 
     def _poll(self) -> None:
-        if not self.auto_poll.isChecked():
+        if not self.auto_poll.isChecked() or not self.diagnostics.connected or self.diagnostics.suspended:
             return
         for target in (LoopTarget.FREQ, LoopTarget.DPLL):
             self.request.emit(
@@ -377,10 +396,13 @@ class AutotunePage(QWidget):
                 pack_autotune(AutotuneAction.QUERY),
             )
 
-    def handle_response(self, tag: str, payload: bytes) -> AutotuneStatus:
+    def handle_response(self, tag: str, payload: bytes) -> AutotuneStatus | None:
+        if self.diagnostics.response(tag, payload):
+            return None
         status = unpack_autotune(payload)
-        target = tag.split(":")[1]
-        (self.freq if target == "freq" else self.dpll).update_status(status)
+        target = LoopTarget.FREQ if tag.split(":")[1] == "freq" else LoopTarget.DPLL
+        (self.freq if target is LoopTarget.FREQ else self.dpll).update_status(status)
+        self.diagnostics.status(target, status)
         return status
 
 
@@ -516,6 +538,7 @@ class MainWindow(QMainWindow):
         self.connection.disconnect_requested.connect(self.disconnect_serial)
         self.manual.request.connect(self.send_request)
         self.autotune.request.connect(self.send_request)
+        self.autotune.log.connect(self.append_log)
         self.validation.start_requested.connect(self.start_validation)
         self.validation.stop_requested.connect(self.stop_validation)
         self.stability.request.connect(self.send_request)
@@ -568,9 +591,11 @@ class MainWindow(QMainWindow):
             self.worker.wait(2000)
             self.worker = None
         self.pending.clear()
+        self.autotune.diagnostics.set_connected(False)
         self.connection.set_connected(False, "未连接")
 
     def _connection_changed(self, connected: bool, message: str) -> None:
+        self.autotune.diagnostics.set_connected(connected)
         if not connected:
             self.stability.disconnected()
         self.connection.connect_button.setEnabled(True)
@@ -585,10 +610,13 @@ class MainWindow(QMainWindow):
         self.stability.disconnected()
         self.worker = None
         self.pending.clear()
+        self.autotune.diagnostics.set_connected(False)
         self.connection.set_connected(False, "未连接")
 
     def send_request(self, tag: str, command: int, payload: bytes) -> None:
         if self.stability.active and not tag.startswith("stability:"):
+            return
+        if self.validation_logger and not tag.startswith("validation:"):
             return
         if not self.worker or not self.worker.isRunning():
             if tag.startswith("manual:freq:frequency_"):
@@ -627,10 +655,18 @@ class MainWindow(QMainWindow):
             self.stability.failed(tag, message)
         if tag.startswith("manual:freq:frequency_"):
             self.manual.freq.frequency_failed(message)
+        if tag.startswith("autotune:"):
+            self.autotune.diagnostics.failed(tag, message)
         self.append_log(f"ERROR {tag}: {message}")
         self.statusBar().showMessage(f"{tag}: {message}", 5000)
         if tag.startswith("validation:"):
-            self._finish_validation_trial("ERROR", message)
+            self.validation_queue.clear()
+            self._write_record("ERROR", note=message)
+            if self.validation_phase == "cancel_wait":
+                self.append_log("取消/回退状态未确认；本批次终止，请重新连接后 QUERY 确认设备状态")
+                self._finish_validation_batch()
+            else:
+                self._cancel_validation("通信错误：" + message)
 
     def start_validation(self, plan_text: str, output_dir: str) -> None:
         if self.stability.active:
@@ -649,12 +685,19 @@ class MainWindow(QMainWindow):
             for repetition in range(1, case.repeat + 1):
                 self.validation_queue.append((case, repetition))
         self.validation.set_running(True)
+        self._validation_auto_poll = self.autotune.auto_poll.isChecked()
         self.autotune.auto_poll.setChecked(False)
+        self.autotune.diagnostics.set_suspended(True)
+        self.manual.setEnabled(False)
+        self.autotune.setEnabled(False)
+        self.stability.setEnabled(False)
         self.validation_timer.start()
         self.append_log(f"批次验证开始，共 {len(self.validation_queue)} 次")
         self._begin_validation_trial()
 
     def _begin_validation_trial(self) -> None:
+        if self.validation_logger is None:
+            return
         if not self.validation_queue:
             self._finish_validation_batch()
             return
@@ -694,6 +737,8 @@ class MainWindow(QMainWindow):
         case = self.validation_case
         if case is None:
             return
+        if self.validation_phase == "cancel_wait" and tag in {"validation:center", "validation:pid"}:
+            return
         if tag == "validation:center":
             unpack_ack(payload)
             self.validation_phase = "configure_pid"
@@ -707,9 +752,15 @@ class MainWindow(QMainWindow):
             card = self.autotune.freq if case.target is LoopTarget.FREQ else self.autotune.dpll
             card.update_status(status)
             self._write_record("QUERY" if tag == "validation:query" else tag.split(":")[1].upper(), status)
+            if self.validation_phase == "cancel_wait":
+                if not status.busy:
+                    self._write_record("CANCELED" if status.exec_name == "CANCELED" else "FAILED", status,
+                                       getattr(self, "validation_cancel_note", "停止验证"))
+                    self._finish_validation_batch()
+                return
             if tag == "validation:start":
-                if status.result_name == "BUSY":
-                    self._finish_validation_trial("FAILED", "全局仲裁器忙")
+                if status.result_code != 2 or not status.busy:
+                    self._finish_validation_trial("FAILED", status.result_name, status)
                 else:
                     self.validation_phase = "poll"
             elif tag == "validation:query":
@@ -723,10 +774,14 @@ class MainWindow(QMainWindow):
         if case is None:
             return
         if time.monotonic() > self.validation_deadline:
-            self.send_request("validation:cancel", case.target.command, pack_autotune(AutotuneAction.CANCEL))
-            self._finish_validation_trial("FAILED", "验证超时")
+            if self.validation_phase == "cancel_wait":
+                self._write_record("ERROR", note="取消/回退等待超时，设备状态未确认")
+                self.validation_queue.clear()
+                self._finish_validation_batch()
+            else:
+                self._cancel_validation("验证超时")
             return
-        if self.validation_phase == "poll":
+        if self.validation_phase in {"poll", "cancel_wait"}:
             self.send_request("validation:query", case.target.command, pack_autotune(AutotuneAction.QUERY))
 
     def _write_record(self, event: str, status: AutotuneStatus | None = None, note: str = "") -> None:
@@ -753,11 +808,21 @@ class MainWindow(QMainWindow):
         self.validation_phase = "idle"
         QTimer.singleShot(500, self._begin_validation_trial)
 
-    def stop_validation(self) -> None:
-        if self.validation_case and self.validation_case.autotune:
-            self.send_request("validation:cancel", self.validation_case.target.command, pack_autotune(AutotuneAction.CANCEL))
+    def _cancel_validation(self, note: str) -> None:
         self.validation_queue.clear()
+        case = self.validation_case
+        if case and case.autotune and self.worker and self.worker.isRunning():
+            if self.validation_phase != "cancel_wait":
+                self.validation_cancel_note = note
+                self.validation_phase = "cancel_wait"
+                self.validation_deadline = time.monotonic() + 10.0
+                self.send_request("validation:cancel", case.target.command, pack_autotune(AutotuneAction.CANCEL))
+                self.append_log(note + "；等待 PS 取消与回退完成")
+            return
         self._finish_validation_batch()
+
+    def stop_validation(self) -> None:
+        self._cancel_validation("用户停止验证")
 
     def _finish_validation_batch(self) -> None:
         self.validation_timer.stop()
@@ -768,7 +833,11 @@ class MainWindow(QMainWindow):
             self.validation_logger.close()
             self.validation_logger = None
         self.validation.set_running(False)
-        self.autotune.auto_poll.setChecked(True)
+        self.autotune.auto_poll.setChecked(getattr(self, "_validation_auto_poll", True))
+        self.autotune.diagnostics.set_suspended(False)
+        self.manual.setEnabled(True)
+        self.autotune.setEnabled(True)
+        self.stability.setEnabled(True)
         self.append_log("批次验证结束")
 
     def closeEvent(self, event) -> None:
@@ -777,7 +846,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "正在停止", "请等待原参数恢复后再次关闭窗口。")
             event.ignore()
             return
-        self.stop_validation()
+        if self.validation_logger:
+            self.stop_validation()
+            if self.validation_logger:
+                QMessageBox.information(self, "正在停止", "请等待 PS 取消与回退完成后再次关闭窗口。")
+                event.ignore()
+                return
         self.disconnect_serial()
         super().closeEvent(event)
 
@@ -798,6 +872,7 @@ class MainWindow(QMainWindow):
             self.autotune.auto_poll.setChecked(previous_poll)
 
     def _stability_running(self, running: bool) -> None:
+        self.autotune.diagnostics.set_suspended(running)
         if running:
             self._saved_auto_poll = self.autotune.auto_poll.isChecked()
             self.autotune.auto_poll.setChecked(False)

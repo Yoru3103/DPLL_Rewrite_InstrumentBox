@@ -69,6 +69,9 @@ class AutotuneAction(IntEnum):
     CANCEL = 2
     CLEAR = 3
     SET_POLICY = 4
+    DIAGNOSTIC = 5
+    READ_CONFIG = 6
+    WRITE_CONFIG = 7
 
 
 class AutotunePolicy(IntEnum):
@@ -90,7 +93,9 @@ HEALTH_STATE_NAMES = {
 RESULT_NAMES = {
     0: "NONE", 1: "SUCCESS", 2: "ACCEPTED", 3: "BUSY", 4: "REJECTED",
     5: "INVALID_ACTION", 6: "INVALID_POLICY", 7: "NOT_LOCKED",
-    8: "READBACK_ERROR", 9: "CANCELED",
+    8: "READBACK_ERROR", 9: "CANCELED", 10: "UNSUPPORTED", 11: "DATA_ERROR",
+    12: "NO_IMPROVEMENT", 13: "INPUT_CHANGED", 14: "VERIFY_FAILED",
+    15: "TIMEOUT", 16: "ROLLBACK_FAILED", 17: "BAD_CONFIG",
 }
 PROFILE_NAMES = {
     0: "ORIGINAL", 1: "SAFE", 2: "TRACK_WEAK", 3: "TRACK_MEDIUM",
@@ -255,6 +260,8 @@ def pack_autotune(action: AutotuneAction, policy: AutotunePolicy | None = None) 
 def unpack_autotune(payload: bytes) -> AutotuneStatus:
     if len(payload) != 18:
         raise ProtocolError(f"autotune response must be 18 bytes, got {len(payload)}")
+    if payload[0] not in (1, 2):
+        raise ProtocolError(f"unsupported autotune protocol version {payload[0]}")
     return AutotuneStatus(
         protocol_version=payload[0],
         action=payload[1],

@@ -45,6 +45,12 @@ architecture Behavioral of N_times_clk_FIR_wrapper is
 	
 	signal flag_times_N_d1             : std_logic                               := '0';
 	signal flag_times_N_d2             : std_logic                               := '0';
+	signal flag_times_N_d3             : std_logic                               := '0';
+	-- Resolve the source toggle before using it as a bundled-data enable.
+	-- Only this DigitalPLL wrapper is used at the 80:1 clock ratio.
+	attribute ASYNC_REG : string;
+	attribute ASYNC_REG of flag_times_N_d1 : signal is "TRUE";
+	attribute ASYNC_REG of flag_times_N_d2 : signal is "TRUE";
 	-- Data when first transfered to the "times N" clk domain
 	signal data_times_N_clk_enable     : std_logic                               := '0';
 	signal data_times_N                : std_logic_vector(N_BITS_IN-1 downto 0)  := (others => '0');
@@ -77,8 +83,10 @@ begin
 			-- we transfer the data at any toggle of the 1x flag			
 			flag_times_N_d1 <= flag_times_1;
 			flag_times_N_d2 <= flag_times_N_d1;
-			--if flag_times_N_d1 /= flag_times_1 then
-			if flag_times_N_d2 /= flag_times_N_d1 then
+			flag_times_N_d3 <= flag_times_N_d2;
+			-- Earliest data capture is the third fast edge after launch.
+			-- The source bundle is stable until the next 320 ns slow edge.
+			if flag_times_N_d3 /= flag_times_N_d2 then
 				data_times_N <= data_in;
 				data_times_N_clk_enable <= '1';
 			end if;

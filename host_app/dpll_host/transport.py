@@ -64,7 +64,7 @@ class SerialWorker(QThread):
                 try:
                     device.write(pack_request(request.command, request.payload))
                     device.flush()
-                    frame = self._wait_for_frame(device, decoder, request.command, request.timeout_s)
+                    frame = self._wait_for_frame(device, decoder, request.command, request.timeout_s, request.payload)
                     self.response.emit(request.tag, frame.command, frame.payload)
                 except Exception as exc:
                     self.failed.emit(request.tag, str(exc))
@@ -73,11 +73,21 @@ class SerialWorker(QThread):
             self.connected.emit(False, "串口已关闭")
 
     @staticmethod
-    def _wait_for_frame(device: serial.Serial, decoder: StreamDecoder, command: int, timeout_s: float) -> Frame:
+    def _wait_for_frame(device: serial.Serial, decoder: StreamDecoder, command: int, timeout_s: float,
+                        request_payload: bytes = b"") -> Frame:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             data = device.read(max(device.in_waiting, 1))
             for frame in decoder.feed(data):
-                if frame.command == command:
-                    return frame
+                if frame.command != command:
+                    continue
+                if command in (0x97, 0x98) and request_payload:
+                    # The legacy frame has no transaction ID. At least reject late
+                    # QUERY/config/diagnostic replies belonging to another action.
+                    if len(frame.payload) < 2 or frame.payload[1] != request_payload[0]:
+                        continue
+                    if request_payload[0] == 5 and len(request_payload) == 2 and len(frame.payload) == 44:
+                        if frame.payload[2] != request_payload[1]:
+                            continue
+                return frame
         raise TimeoutError(f"等待命令 0x{command:02X} 响应超时")

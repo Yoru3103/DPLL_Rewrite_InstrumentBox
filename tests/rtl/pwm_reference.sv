@@ -1,3 +1,4 @@
+// Golden pre-retiming implementation: preserve cycle/reset/config semantics.
 /**
  * @brief Red Pitaya PWM module
  *
@@ -10,7 +11,7 @@
  * for more details on the language used herein.
  */
 
-module red_pitaya_pwm #(
+module red_pitaya_pwm_reference #(
   int unsigned CCW = 24,  // configuration counter width (resolution)
   bit  [8-1:0] FULL = 8'd156 // 100% value
 )(
@@ -18,7 +19,7 @@ module red_pitaya_pwm #(
   input  logic           clk ,  // clock
   input  logic           rstn,  // reset
   // configuration
-  input  logic [CCW-1:0] cfg ,  // 
+  input  logic [CCW-1:0] cfg ,  //
   // PWM outputs
   output logic           pwm_o ,  // PWM output - driving RC
   output logic           pwm_s    // PWM synchronization
@@ -26,18 +27,8 @@ module red_pitaya_pwm #(
 
 reg  [ 4-1: 0] bcnt  ;
 reg  [16-1: 0] b     ;
-reg  [ 8-1: 0] vcnt;
-reg  [ 8-1: 0] v;
-// Preserve the original two-stage comparison latency. Precompute the nibble
-// predicates in the old vcnt_r/v_r stage; the output stage only combines bits.
-// Keep the target eight bits wide: 255 + the fractional bit wraps to zero,
-// exactly as the former v_r register did.
-wire [7:0] pwm_target = v + {7'd0, b[0]};
-// Vivado initializes the former vcnt_r/v_r flops to zero at configuration.
-// Preserve that first-cycle predicate (0 <= 0), separately from runtime reset.
-reg cmp_hi_lt = 1'b0;
-reg cmp_hi_eq = 1'b1;
-reg cmp_lo_le = 1'b1;
+reg  [ 8-1: 0] vcnt, vcnt_r;
+reg  [ 8-1: 0] v   , v_r   ;
 // add some registers to help timing closure:
 reg [CCW-1:0] cfg_reg;
 reg pwm_o_reg;
@@ -55,22 +46,19 @@ begin
 	   pwm_o_reg <=  1'b0;
 	end else begin
 	   vcnt   <= (vcnt == FULL) ? 8'h1 : (vcnt + 8'd1) ;
-           // Like the original intermediate registers, these retain their
-           // pre-reset values while rstn is low; only pwm_o_reg resets.
-           cmp_hi_lt <= (vcnt[7:4] <  pwm_target[7:4]);
-           cmp_hi_eq <= (vcnt[7:4] == pwm_target[7:4]);
-           cmp_lo_le <= (vcnt[3:0] <= pwm_target[3:0]);
+	   vcnt_r <= vcnt;
+	   v_r    <= (v + b[0]) ; // add decimal bit to current value
 	   if (vcnt == FULL) begin
 		  bcnt <=  bcnt + 4'h1 ;
 		  v    <= (bcnt == 4'hF) ? cfg_reg[24-1:16] : v ; // new value on 16*FULL
 		  b    <= (bcnt == 4'hF) ? cfg_reg[16-1:0] : {1'b0,b[15:1]} ; // shift right
 	   end
 	   // make PWM duty cycle
-	   pwm_o_reg <= cmp_hi_lt || (cmp_hi_eq && cmp_lo_le);
+	   pwm_o_reg <= (vcnt_r <= v_r) ;
    end
 end
 
 assign pwm_s = (bcnt == 4'hF) && (vcnt == (FULL-1)) ; // latch one before
 assign pwm_o = pwm_o_reg;
 
-endmodule: red_pitaya_pwm
+endmodule: red_pitaya_pwm_reference

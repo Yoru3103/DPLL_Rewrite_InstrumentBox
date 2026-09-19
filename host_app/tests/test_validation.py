@@ -10,6 +10,8 @@ class ValidationPlanTests(unittest.TestCase):
         self.assertEqual(cases[0].target, LoopTarget.FREQ)
         self.assertEqual(cases[1].target, LoopTarget.DPLL)
         self.assertEqual(cases[0].repeat, 3)
+        self.assertEqual(cases[0].timeout_s, 150)
+        self.assertEqual(cases[1].timeout_s, 150)
 
     def test_hex_values(self):
         cases = parse_plan('[{"name":"x","target":"dpll","center_frequency":"0x10",'

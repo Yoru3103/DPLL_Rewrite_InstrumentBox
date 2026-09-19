@@ -1,3 +1,5 @@
+> 2026-09-20：本文为历史记录。当前版本取消Scheme B自动回退，采用完整指标整定及UART v2；见 [完整合同](AUTOTUNE_COMPLETE_DESIGN.md)。
+
 > 历史阶段记录：后续阶段 5A 扩展及当前状态见 [AUTOTUNE_IMPLEMENTATION_PLAN.md](AUTOTUNE_IMPLEMENTATION_PLAN.md)。下述“尚未接入”“保持不变”描述该历史阶段边界。
 
 <!--
